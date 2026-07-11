@@ -1,12 +1,14 @@
-import * as fs from 'fs-extra';
+import { promises as fs } from 'fs';
+import { FastRuleSetName, getFastRuleIds } from './FastLintRules';
 import { Logger } from './utils/Logger';
+import { CallExpression, SourceScanResult, SourceToken, scanSource } from './utils/SourceScanner';
 
 export interface StaticAnalysisResult {
   errors: LintError[];
   warnings: LintError[];
   notes: LintError[];
-  confidence: 'high' | 'medium' | 'low'; // 分析置信度
-  needsCompilerCheck: boolean; // 是否需要编译器检查
+  confidence: 'high' | 'medium' | 'low';
+  needsCompilerCheck: boolean;
 }
 
 export interface LintError {
@@ -18,101 +20,70 @@ export interface LintError {
   code?: string;
 }
 
-export interface AnalysisTask {
-  name: string;
-  analyze: (lines: string[], filePath: string) => Promise<{
-    errors: LintError[];
-    warnings: LintError[];
-    notes: LintError[];
-  }>;
+export interface FastAnalysisOptions {
+  board?: string;
+  ruleSet?: FastRuleSetName;
+}
+
+interface TokenRange {
+  name?: string;
+  start: number;
+  end: number;
+  bodyStart: number;
+  bodyEnd: number;
+}
+
+interface AnalysisBuckets {
+  errors: LintError[];
+  warnings: LintError[];
+  notes: LintError[];
+}
+
+function containsToken(range: TokenRange, tokenIndex: number): boolean {
+  return tokenIndex >= range.bodyStart && tokenIndex <= range.bodyEnd;
+}
+
+function numericArgument(scan: SourceScanResult, call: CallExpression, argumentIndex: number): number | null {
+  const range = call.argumentRanges[argumentIndex];
+  if (!range || range[1] - range[0] !== 1) return null;
+  const token = scan.tokens[range[0]];
+  if (token?.kind !== 'number') return null;
+  const value = Number(token.text.replace(/[uUlL]+$/, ''));
+  return Number.isFinite(value) ? value : null;
 }
 
 export class ParallelStaticAnalyzer {
-  private logger: Logger;
+  constructor(private logger: Logger) {}
 
-  constructor(logger: Logger) {
-    this.logger = logger;
-  }
-
-  /**
-   * 并行执行静态分析
-   */
-  async analyzeFile(sketchPath: string): Promise<StaticAnalysisResult> {
-    const startTime = Date.now();
-    
+  async analyzeFile(sketchPath: string, options: FastAnalysisOptions = {}): Promise<StaticAnalysisResult> {
+    const started = Date.now();
     try {
-      // 读取文件内容
-      const content = await fs.readFile(sketchPath, 'utf-8');
-      const lines = content.split('\n');
+      const content = await fs.readFile(sketchPath, 'utf8');
+      const scan = scanSource(content);
+      const ruleSet = options.ruleSet || (options.board?.toLowerCase().includes('esp32') ? 'esp32' : 'standard');
+      const enabledRules = getFastRuleIds(ruleSet);
+      const buckets: AnalysisBuckets = { errors: [], warnings: [], notes: [] };
+      const functions = this.findFunctions(scan);
+      const loops = this.findLoops(scan);
 
-      // 定义并行分析任务
-      const analysisTasks: AnalysisTask[] = [
-        {
-          name: 'syntax-basic',
-          analyze: async (lines, path) => this.analyzeSyntaxBasics(lines, path)
-        },
-        {
-          name: 'variables',
-          analyze: async (lines, path) => this.analyzeVariables(lines, path)
-        },
-        {
-          name: 'functions',
-          analyze: async (lines, path) => this.analyzeFunctions(lines, path)
-        },
-        {
-          name: 'arduino-specific',
-          analyze: async (lines, path) => this.analyzeArduinoSpecific(lines, path)
-        },
-        {
-          name: 'includes-dependencies',
-          analyze: async (lines, path) => this.analyzeIncludes(lines, path)
-        }
-      ];
+      this.checkDelimiters(scan, sketchPath, buckets.errors);
+      this.checkSemicolons(scan, sketchPath, buckets.errors);
+      this.checkRequiredFunctions(scan, functions, sketchPath, enabledRules, buckets);
+      this.checkIncludes(scan, sketchPath, buckets);
+      this.checkCalls(scan, functions, loops, sketchPath, enabledRules, buckets);
+      this.checkTokenRules(scan, loops, sketchPath, enabledRules, buckets);
+      this.deduplicate(buckets);
 
-      // 并行执行所有分析任务
-      const results = await Promise.all(
-        analysisTasks.map(async (task) => {
-          const taskStart = Date.now();
-          try {
-            const result = await task.analyze(lines, sketchPath);
-            this.logger.debug(`Analysis task '${task.name}' completed in ${Date.now() - taskStart}ms`);
-            return { task: task.name, result, success: true };
-          } catch (error) {
-            this.logger.debug(`Analysis task '${task.name}' failed: ${error}`);
-            return { 
-              task: task.name, 
-              result: { errors: [], warnings: [], notes: [] }, 
-              success: false 
-            };
-          }
-        })
-      );
-
-      // 合并结果
-      const allErrors: LintError[] = [];
-      const allWarnings: LintError[] = [];
-      const allNotes: LintError[] = [];
-
-      results.forEach(({ result }) => {
-        allErrors.push(...result.errors);
-        allWarnings.push(...result.warnings);
-        allNotes.push(...result.notes);
-      });
-
-      // 计算分析置信度和是否需要编译器检查
-      const analysisQuality = this.calculateAnalysisQuality(allErrors, allWarnings, content);
-
-      const totalTime = Date.now() - startTime;
-      this.logger.debug(`Parallel static analysis completed in ${totalTime}ms`);
-
+      const complexity = scan.tokens.length + scan.lines.length;
+      const confidence = buckets.errors.length > 0 || complexity < 2000
+        ? 'high'
+        : complexity < 20000 ? 'medium' : 'low';
+      this.logger.debug(`Single-pass static analysis completed in ${Date.now() - started}ms`);
       return {
-        errors: allErrors,
-        warnings: allWarnings,
-        notes: allNotes,
-        confidence: analysisQuality.confidence,
-        needsCompilerCheck: analysisQuality.needsCompilerCheck
+        ...buckets,
+        confidence,
+        needsCompilerCheck: buckets.errors.length > 0 || confidence === 'low' || buckets.warnings.length > 5
       };
-
     } catch (error) {
       this.logger.error(`Static analysis failed: ${error}`);
       return {
@@ -131,681 +102,224 @@ export class ParallelStaticAnalyzer {
     }
   }
 
-  /**
-   * 分析基础语法（大括号、分号等）
-   */
-  private async analyzeSyntaxBasics(lines: string[], filePath: string): Promise<{
-    errors: LintError[];
-    warnings: LintError[];
-    notes: LintError[];
-  }> {
-    const errors: LintError[] = [];
-    const warnings: LintError[] = [];
-    const notes: LintError[] = [];
-
-    // 检查大括号匹配
-    this.checkBraces(lines, filePath, errors);
-    
-    // 检查分号
-    this.checkSemicolons(lines, filePath, errors, warnings);
-
-    return { errors, warnings, notes };
+  private diagnostic(file: string, token: SourceToken, message: string, severity: LintError['severity'], code: string): LintError {
+    return { file, line: token.line, column: token.column, message, severity, code };
   }
 
-  /**
-   * 分析变量声明和使用 - 支持作用域追踪
-   */
-  private async analyzeVariables(lines: string[], filePath: string): Promise<{
-    errors: LintError[];
-    warnings: LintError[];
-    notes: LintError[];
-  }> {
-    const errors: LintError[] = [];
-    const warnings: LintError[] = [];
-    const notes: LintError[] = [];
-
-    // 按函数作用域分类追踪变量
-    const globalVars = new Set<string>();
-    const functionScopes = new Map<string, Set<string>>(); // 函数名 -> 声明的变量集合
-    const usedVarsInLine = new Map<number, Array<{ varName: string; column: number }>>(); // 行号 -> 使用的变量
-    
-    let currentFunction: string | null = null;
-    let braceDepth = 0;
-    
-    // 第一遍：建立作用域和变量声明的映射
-    lines.forEach((line, lineIndex) => {
-      const trimmed = line.trim();
-      
-      // 跳过预处理指令和注释
-      if (trimmed.startsWith('#') || trimmed.startsWith('//') || trimmed.startsWith('/*')) {
-        return;
-      }
-      
-      // 追踪大括号深度和函数作用域
-      const openBraces = (line.match(/\{/g) || []).length;
-      const closeBraces = (line.match(/\}/g) || []).length;
-      
-      // 检查函数定义（setup/loop 等）
-      const funcDef = line.match(/\b(setup|loop|(\w+)\s*\([^)]*\))\s*\{/);
-      if (funcDef && braceDepth === 0) {
-        // 进入新函数作用域
-        currentFunction = funcDef[1].replace(/\s*\{/, '').trim();
-        if (!functionScopes.has(currentFunction)) {
-          functionScopes.set(currentFunction, new Set());
-        }
-      }
-      
-      braceDepth += openBraces - closeBraces;
-      
-      // 在函数作用域内检查变量声明
-      const varDecl = this.extractVariableDeclaration(trimmed);
-      if (varDecl) {
-        if (currentFunction && braceDepth > 0) {
-          // 在函数作用域内
-          functionScopes.get(currentFunction)?.add(varDecl);
-        } else if (braceDepth === 0) {
-          // 在全局作用域
-          globalVars.add(varDecl);
-        }
-      }
-      
-      // 第二遍处理会在下面进行
-      if (braceDepth === 0) {
-        currentFunction = null;
-      }
-    });
-    
-    // 第二遍：检查变量使用
-    currentFunction = null;
-    braceDepth = 0;
-    const availableVars = new Set<string>([...globalVars]); // 当前可用变量（全局 + 当前函数作用域）
-    
-    lines.forEach((line, lineIndex) => {
-      const trimmed = line.trim();
-      
-      // 跳过预处理指令和注释
-      if (trimmed.startsWith('#') || trimmed.startsWith('//') || trimmed.startsWith('/*')) {
-        return;
-      }
-      
-      // 更新大括号深度和函数作用域
-      const openBraces = (line.match(/\{/g) || []).length;
-      const closeBraces = (line.match(/\}/g) || []).length;
-      
-      // 检查函数定义
-      const funcDef = line.match(/\b(setup|loop|(\w+)\s*\([^)]*\))\s*\{/);
-      if (funcDef && braceDepth === 0) {
-        currentFunction = funcDef[1].replace(/\s*\{/, '').trim();
-        // 重建可用变量：全局 + 当前函数局部
-        availableVars.clear();
-        globalVars.forEach(v => availableVars.add(v));
-        if (currentFunction && functionScopes.has(currentFunction)) {
-          functionScopes.get(currentFunction)?.forEach(v => availableVars.add(v));
-        }
-      }
-      
-      braceDepth += openBraces - closeBraces;
-      
-      if (braceDepth === 0) {
-        currentFunction = null;
-      }
-      
-      // 检查变量使用
-      const varsInLine = this.extractVariableUsages(line, lineIndex + 1);
-      varsInLine.forEach(({ varName, column }) => {
-        if (!availableVars.has(varName) && !this.isArduinoBuiltin(varName) && !this.isKeyword(varName)) {
-          warnings.push({
-            file: filePath,
-            line: lineIndex + 1,
-            column,
-            message: `Possibly undeclared variable: '${varName}'`,
-            severity: 'warning',
-            code: 'UNDECLARED_VAR'
-          });
-        }
-      });
-    });
-
-    return { errors, warnings, notes };
-  }
-
-  /**
-   * 分析函数定义和调用
-   */
-  private async analyzeFunctions(lines: string[], filePath: string): Promise<{
-    errors: LintError[];
-    warnings: LintError[];
-    notes: LintError[];
-  }> {
-    const errors: LintError[] = [];
-    const warnings: LintError[] = [];
-    const notes: LintError[] = [];
-
-    const functions = new Set<string>();
-    const functionCalls = new Set<string>();
-
-    lines.forEach((line, lineIndex) => {
-      const trimmed = line.trim();
-      
-      // 检查函数定义
-      const funcDef = this.extractFunctionDefinition(trimmed);
-      if (funcDef) {
-        functions.add(funcDef);
-      }
-      
-      // 检查函数调用
-      const funcCalls = this.extractFunctionCalls(trimmed);
-      funcCalls.forEach(call => functionCalls.add(call));
-      
-      // 检查必需的Arduino函数
-      if (this.isRequiredArduinoFunction(trimmed)) {
-        notes.push({
-          file: filePath,
-          line: lineIndex + 1,
-          column: 1,
-          message: `Found required Arduino function: ${this.extractFunctionName(trimmed)}`,
-          severity: 'note',
-          code: 'ARDUINO_FUNCTION'
-        });
-      }
-    });
-
-    // 检查缺少的必需函数
-    if (!functions.has('setup')) {
-      warnings.push({
-        file: filePath,
-        line: 1,
-        column: 1,
-        message: 'Missing required setup() function',
-        severity: 'warning',
-        code: 'MISSING_SETUP'
-      });
+  private findFunctions(scan: SourceScanResult): TokenRange[] {
+    const ranges: TokenRange[] = [];
+    for (let index = 0; index + 2 < scan.tokens.length; index++) {
+      const token = scan.tokens[index];
+      if (token.kind !== 'identifier' || scan.tokens[index + 1].text !== '(') continue;
+      const closeParen = scan.delimiterPairs.get(index + 1);
+      if (closeParen === undefined || scan.tokens[closeParen + 1]?.text !== '{') continue;
+      const closeBrace = scan.delimiterPairs.get(closeParen + 1);
+      if (closeBrace === undefined) continue;
+      ranges.push({ name: token.text, start: index, end: closeBrace, bodyStart: closeParen + 2, bodyEnd: closeBrace - 1 });
     }
-
-    if (!functions.has('loop')) {
-      warnings.push({
-        file: filePath,
-        line: 1,
-        column: 1,
-        message: 'Missing required loop() function',
-        severity: 'warning',
-        code: 'MISSING_LOOP'
-      });
-    }
-
-    return { errors, warnings, notes };
+    return ranges;
   }
 
-  /**
-   * 分析Arduino特定语法
-   */
-  private async analyzeArduinoSpecific(lines: string[], filePath: string): Promise<{
-    errors: LintError[];
-    warnings: LintError[];
-    notes: LintError[];
-  }> {
-    const errors: LintError[] = [];
-    const warnings: LintError[] = [];
-    const notes: LintError[] = [];
-
-    lines.forEach((line, lineIndex) => {
-      const trimmed = line.trim();
-      
-      // 检查常见的Arduino错误
-      if (trimmed.includes('Serial.begin') && !trimmed.includes('setup')) {
-        // 这个检查需要更复杂的逻辑，这里简化
-        notes.push({
-          file: filePath,
-          line: lineIndex + 1,
-          column: 1,
-          message: 'Serial.begin() should typically be called in setup()',
-          severity: 'note',
-          code: 'SERIAL_PLACEMENT'
-        });
+  private findLoops(scan: SourceScanResult): TokenRange[] {
+    const ranges: TokenRange[] = [];
+    for (let index = 0; index + 2 < scan.tokens.length; index++) {
+      if (!['for', 'while'].includes(scan.tokens[index].text) || scan.tokens[index + 1].text !== '(') continue;
+      const closeParen = scan.delimiterPairs.get(index + 1);
+      if (closeParen === undefined) continue;
+      const bodyOpen = closeParen + 1;
+      if (scan.tokens[bodyOpen]?.text === '{') {
+        const bodyClose = scan.delimiterPairs.get(bodyOpen);
+        if (bodyClose !== undefined) ranges.push({ start: index, end: bodyClose, bodyStart: bodyOpen + 1, bodyEnd: bodyClose - 1 });
+      } else {
+        let bodyEnd = bodyOpen;
+        while (bodyEnd < scan.tokens.length && scan.tokens[bodyEnd].text !== ';') bodyEnd++;
+        ranges.push({ start: index, end: bodyEnd, bodyStart: bodyOpen, bodyEnd });
       }
-
-      // 检查引脚模式设置
-      if (trimmed.includes('digitalWrite') || trimmed.includes('digitalRead')) {
-        const pinMatch = trimmed.match(/digital(?:Write|Read)\s*\(\s*(\d+)/);
-        if (pinMatch) {
-          notes.push({
-            file: filePath,
-            line: lineIndex + 1,
-            column: trimmed.indexOf(pinMatch[0]) + 1,
-            message: `Using pin ${pinMatch[1]} - ensure pinMode() is set`,
-            severity: 'note',
-            code: 'PIN_MODE_CHECK'
-          });
-        }
-      }
-    });
-
-    return { errors, warnings, notes };
+    }
+    return ranges;
   }
 
-  /**
-   * 分析包含文件和依赖
-   */
-  private async analyzeIncludes(lines: string[], filePath: string): Promise<{
-    errors: LintError[];
-    warnings: LintError[];
-    notes: LintError[];
-  }> {
-    const errors: LintError[] = [];
-    const warnings: LintError[] = [];
-    const notes: LintError[] = [];
-
-    const includes: string[] = [];
-
-    lines.forEach((line, lineIndex) => {
-      const trimmed = line.trim();
-      
-      // 检查 #include 语句
-      if (trimmed.startsWith('#include')) {
-        const includeMatch = trimmed.match(/#include\s*[<"](.*?)[>"]/);//
-        if (includeMatch) {
-          const includeName = includeMatch[1];
-          includes.push(includeName);
-          
-          notes.push({
-            file: filePath,
-            line: lineIndex + 1,
-            column: 1,
-            message: `Include dependency: ${includeName}`,
-            severity: 'note',
-            code: 'INCLUDE_FOUND'
-          });
-        }
-      }
-    });
-
-    // 检查常见的缺失包含
-    const hasArduinoInclude = includes.some(inc => inc.includes('Arduino.h'));
-    if (!hasArduinoInclude && lines.some(line => 
-      line.includes('pinMode') || line.includes('digitalWrite') || line.includes('Serial')
-    )) {
-      warnings.push({
-        file: filePath,
-        line: 1,
-        column: 1,
-        message: 'Arduino functions used but Arduino.h not explicitly included (may be auto-included)',
-        severity: 'warning',
-        code: 'MISSING_ARDUINO_H'
-      });
-    }
-
-    return { errors, warnings, notes };
-  }
-
-  /**
-   * 计算分析质量和是否需要编译器检查
-   */
-  private calculateAnalysisQuality(errors: LintError[], warnings: LintError[], content: string): {
-    confidence: 'high' | 'medium' | 'low';
-    needsCompilerCheck: boolean;
-  } {
-    // 如果发现明显的语法错误，置信度高，但仍需编译器验证
-    if (errors.length > 0) {
-      return { confidence: 'high', needsCompilerCheck: true };
-    }
-
-    // 检查代码复杂度
-    const complexity = this.calculateCodeComplexity(content);
-    const warningCount = warnings.length;
-
-    // 基于复杂度和警告数量决策
-    if (complexity < 50 && warningCount <= 2) {
-      return { confidence: 'high', needsCompilerCheck: false };
-    } else if (complexity < 100 && warningCount <= 5) {
-      return { confidence: 'medium', needsCompilerCheck: warningCount > 3 };
-    } else {
-      return { confidence: 'low', needsCompilerCheck: true };
+  private checkDelimiters(scan: SourceScanResult, file: string, errors: LintError[]): void {
+    for (const issue of scan.delimiterIssues) {
+      errors.push({ file, line: issue.line, column: issue.column, message: issue.message, severity: 'error', code: 'UNMATCHED_BRACKET' });
     }
   }
 
-  /**
-   * 计算代码复杂度（简化版）
-   */
-  private calculateCodeComplexity(content: string): number {
-    let complexity = 0;
-    
-    // 基于代码行数
-    complexity += content.split('\n').length * 0.1;
-    
-    // 基于控制结构数量
-    const controlStructures = content.match(/\b(if|for|while|switch|case)\b/g);
-    complexity += (controlStructures?.length || 0) * 2;
-    
-    // 基于函数数量
-    const functions = content.match(/\w+\s*\([^)]*\)\s*{/g);
-    complexity += (functions?.length || 0) * 3;
-    
-    // 基于包含数量
-    const includes = content.match(/#include/g);
-    complexity += (includes?.length || 0) * 1;
-
-    return complexity;
-  }
-
-  // === 辅助方法（从原有代码迁移和增强）===
-
-  /**
-   * 检查大括号匹配
-   */
-  private checkBraces(lines: string[], filePath: string, errors: LintError[]): void {
-    const braceStack: { line: number; char: string; column: number }[] = [];
-    
-    lines.forEach((line, lineIndex) => {
-      for (let i = 0; i < line.length; i++) {
-        const char = line[i];
-        
-        // 跳过字符串和注释中的括号
-        if (this.isInStringOrComment(line, i)) continue;
-        
-        if (char === '{' || char === '(' || char === '[') {
-          braceStack.push({ line: lineIndex + 1, char, column: i + 1 });
-        } else if (char === '}' || char === ')' || char === ']') {
-          const expected = char === '}' ? '{' : char === ')' ? '(' : '[';
-          
-          if (braceStack.length === 0) {
-            errors.push({
-              file: filePath,
-              line: lineIndex + 1,
-              column: i + 1,
-              message: `Unexpected '${char}' - no matching opening bracket`,
-              severity: 'error',
-              code: 'UNMATCHED_BRACKET'
-            });
-          } else {
-            const last = braceStack.pop()!;
-            if (last.char !== expected) {
-              errors.push({
-                file: filePath,
-                line: lineIndex + 1,
-                column: i + 1,
-                message: `Mismatched bracket: expected '${this.getClosingBrace(last.char)}' but found '${char}'`,
-                severity: 'error',
-                code: 'MISMATCHED_BRACKET'
-              });
-            }
-          }
-        }
-      }
-    });
-    
-    // 检查未关闭的括号
-    braceStack.forEach(brace => {
+  private checkSemicolons(scan: SourceScanResult, file: string, errors: LintError[]): void {
+    for (let index = 0; index < scan.codeLines.length; index++) {
+      const line = scan.codeLines[index];
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#') || /[;{},:]$/.test(trimmed)) continue;
+      if (/^(?:if|for|while|switch|else|do|class|struct|enum|namespace)\b/.test(trimmed)) continue;
+      if (/^(?:public|private|protected)\s*:/.test(trimmed) || trimmed.endsWith('\\')) continue;
+      if (!/[=+\-*/%)]/.test(trimmed)) continue;
       errors.push({
-        file: filePath,
-        line: brace.line,
-        column: brace.column,
-        message: `Unmatched '${brace.char}' - missing closing '${this.getClosingBrace(brace.char)}'`,
+        file,
+        line: index + 1,
+        column: Math.max(1, line.length),
+        message: "Expected ';' at end of statement",
         severity: 'error',
-        code: 'UNCLOSED_BRACKET'
+        code: 'MISSING_SEMICOLON'
       });
-    });
+    }
   }
 
-  /**
-   * 检查分号
-   */
-  private checkSemicolons(lines: string[], filePath: string, errors: LintError[], warnings: LintError[]): void {
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      let trimmed = line.trim();
-      
-      // 跳过空行、注释行、预处理指令
-      if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('/*') || 
-          trimmed.startsWith('*') || trimmed.startsWith('#')) {
-        continue;
-      }
-      
-      // 移除行尾注释，但需要注意不要移除字符串中的 //
-      // 简单方法：找到第一个 // 位置，确保它不在字符串内
-      const commentIndex = this.findCommentStart(trimmed);
-      if (commentIndex !== -1) {
-        trimmed = trimmed.substring(0, commentIndex).trim();
-      }
-      
-      // 跳过空行（注释移除后可能变为空）
-      if (!trimmed) {
-        continue;
-      }
-      
-      // 跳过控制结构、函数定义等不需要分号的行
-      if (this.isControlStructure(trimmed) || this.isFunctionDefinition(trimmed) || 
-          trimmed.endsWith('{') || trimmed.endsWith('}')) {
-        continue;
-      }
-      
-      // 检查是否是链式调用的一部分
-      if (this.isPartOfChainedCall(lines, i)) {
-        continue;
-      }
-      
-      // 检查是否缺少分号
-      if (this.shouldEndWithSemicolon(trimmed) && !trimmed.endsWith(';')) {
-        errors.push({
-          file: filePath,
-          line: i + 1,
-          column: line.length,
-          message: `Expected ';' at end of statement`,
-          severity: 'error',
-          code: 'MISSING_SEMICOLON'
+  private checkRequiredFunctions(
+    scan: SourceScanResult,
+    functions: TokenRange[],
+    file: string,
+    enabledRules: Set<string>,
+    buckets: AnalysisBuckets
+  ): void {
+    for (const name of ['setup', 'loop']) {
+      const range = functions.find(item => item.name === name);
+      if (!range) {
+        buckets.warnings.push({
+          file, line: 1, column: 1, message: `Missing required ${name}() function`, severity: 'warning', code: `MISSING_${name.toUpperCase()}`
         });
-      }
-    }
-  }
-
-  // === 辅助方法 ===
-
-  private findCommentStart(line: string): number {
-    // 找到第一个注释位置（// 或 /*），但要确保不在字符串内
-    let inDoubleQuote = false;
-    let inSingleQuote = false;
-    
-    for (let i = 0; i < line.length - 1; i++) {
-      const char = line[i];
-      const nextChar = line[i + 1];
-      
-      // 处理转义字符
-      if (char === '\\') {
-        i++; // 跳过下一个字符
         continue;
       }
-      
-      // 切换引号状态
-      if (char === '"' && !inSingleQuote) {
-        inDoubleQuote = !inDoubleQuote;
-      } else if (char === "'" && !inDoubleQuote) {
-        inSingleQuote = !inSingleQuote;
-      }
-      
-      // 如果不在字符串内，检查注释开始
-      if (!inDoubleQuote && !inSingleQuote) {
-        // 检查 //
-        if (char === '/' && nextChar === '/') {
-          return i;
-        }
-        // 检查 /*
-        if (char === '/' && nextChar === '*') {
-          return i;
-        }
+      const token = scan.tokens[range.start];
+      buckets.notes.push(this.diagnostic(file, token, `Found required Arduino function: ${name}`, 'note', 'ARDUINO_FUNCTION'));
+      if (range.bodyStart > range.bodyEnd && enabledRules.has(`empty-${name}`)) {
+        buckets.notes.push(this.diagnostic(file, token, `Empty ${name}() function`, 'note', `empty-${name}`));
       }
     }
-    
-    return -1;
   }
 
-  private isInStringOrComment(line: string, pos: number): boolean {
-    // 简化版本：检查是否在字符串或注释中
-    const beforePos = line.substring(0, pos);
-    const quotes = (beforePos.match(/"/g) || []).length;
-    const singleQuotes = (beforePos.match(/'/g) || []).length;
-    const commentStart = beforePos.indexOf('//');
-    
-    return (quotes % 2 === 1) || (singleQuotes % 2 === 1) || (commentStart !== -1 && commentStart < pos);
-  }
-
-  private getClosingBrace(openBrace: string): string {
-    const mapping: { [key: string]: string } = { '{': '}', '(': ')', '[': ']' };
-    return mapping[openBrace] || openBrace;
-  }
-
-  private isControlStructure(line: string): boolean {
-    return /^\s*(if|else|for|while|switch|case|do)\b/.test(line);
-  }
-
-  private isFunctionDefinition(line: string): boolean {
-    return /\w+\s*\([^)]*\)\s*\{?\s*$/.test(line) && !line.includes('=');
-  }
-
-  private isPartOfChainedCall(lines: string[], currentLine: number): boolean {
-    const line = lines[currentLine].trim();
-    
-    // 检查当前行是否以 . 开始（链式调用的中间部分）
-    if (line.startsWith('.')) {
-      return true;
-    }
-    
-    // 检查下一行是否以 . 开始（当前行是链式调用的开始）
-    if (currentLine + 1 < lines.length) {
-      const nextLine = lines[currentLine + 1].trim();
-      if (nextLine.startsWith('.')) {
-        return true;
-      }
-    }
-    
-    return false;
-  }
-
-  private shouldEndWithSemicolon(line: string): boolean {
-    // 简化检查：大部分语句都应该以分号结尾
-    return !line.endsWith('{') && !line.endsWith('}') && 
-           !this.isControlStructure(line) && 
-           !line.includes('#') && line.length > 0;
-  }
-
-  private extractVariableDeclaration(line: string): string | null {
-    // 简化版本：提取变量声明
-    const matches = line.match(/\b(int|float|double|char|bool|String|byte|long)\s+(\w+)/);
-    return matches ? matches[2] : null;
-  }
-
-  private extractVariableUsages(line: string, lineNumber: number): Array<{ varName: string; line: number; column: number }> {
-    const variables: Array<{ varName: string; line: number; column: number }> = [];
-    
-    // 跳过预处理指令
-    if (line.trim().startsWith('#')) {
-      return variables;
-    }
-    
-    // 使用正则表达式匹配变量名，但要更精确
-    const varPattern = /\b[a-zA-Z_]\w*\b/g;
-    let match;
-    
-    while ((match = varPattern.exec(line)) !== null) {
-      const varName = match[0];
-      // 正确计算列位置：match.index 是基于0的，需要+1转换为基于1的列号
-      const column = match.index + 1;
-      
-      // 过滤掉关键字、Arduino 内置函数和类型
-      if (!this.isKeyword(varName) && !this.isArduinoBuiltin(varName) && !this.isType(varName)) {
-        // 进一步检查：避免把函数调用、属性访问等当作变量
-        if (this.isValidVariableUsage(line, match.index, varName)) {
-          variables.push({ varName, line: lineNumber, column });
-        }
-      }
-    }
-    
-    return variables;
-  }
-  
-  private isValidVariableUsage(line: string, index: number, varName: string): boolean {
-    // 检查是否是赋值语句左侧的变量（可能是未声明变量的使用）
-    const afterVar = line.substring(index + varName.length);
-    const beforeVar = line.substring(0, index);
-    
-    // 如果后面紧跟着 '('，这是函数调用，不是变量使用
-    if (afterVar.trim().startsWith('(')) {
-      return false;
-    }
-    
-    // 如果前面是 '.'，这是属性访问，不是独立变量
-    if (beforeVar.trim().endsWith('.')) {
-      return false;
-    }
-    
-    // 如果是 #include 语句中的内容，跳过
-    if (beforeVar.includes('#include')) {
-      return false;
-    }
-    
-    // 如果是字符串字面量中的内容，跳过
-    const quoteBefore = beforeVar.split('"').length - 1;
-    const quoteAfter = afterVar.split('"').length - 1;
-    if (quoteBefore % 2 === 1) {
-      return false;
-    }
-    
-    return true;
-  }
-  
-  private isType(word: string): boolean {
-    const types = [
-      'int', 'float', 'double', 'char', 'byte', 'boolean', 'String',
-      'void', 'long', 'short', 'unsigned', 'signed', 'const', 'static',
-      'uint8_t', 'uint16_t', 'uint32_t', 'int8_t', 'int16_t', 'int32_t'
-    ];
-    return types.includes(word);
-  }
-
-  private isGlobalScope(lines: string[], lineIndex: number): boolean {
-    // 简化版本：检查是否在全局作用域
-    for (let i = 0; i < lineIndex; i++) {
-      if (lines[i].includes('{')) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  private extractFunctionDefinition(line: string): string | null {
-    const match = line.match(/(\w+)\s*\([^)]*\)\s*\{?/);
-    return match ? match[1] : null;
-  }
-
-  private extractFunctionCalls(line: string): string[] {
-    const calls: string[] = [];
-    const matches = line.match(/(\w+)\s*\(/g);
-    if (matches) {
-      matches.forEach(match => {
-        const funcName = match.replace(/\s*\(/, '');
-        calls.push(funcName);
+  private checkIncludes(scan: SourceScanResult, file: string, buckets: AnalysisBuckets): void {
+    const includes: string[] = [];
+    for (let index = 0; index < scan.codeLines.length; index++) {
+      if (!/^\s*#\s*include\b/.test(scan.codeLines[index])) continue;
+      const match = scan.lines[index].match(/^\s*#\s*include\s*[<"]([^>"]+)[>"]/);
+      if (!match) continue;
+      includes.push(match[1]);
+      buckets.notes.push({
+        file, line: index + 1, column: 1, message: `Include dependency: ${match[1]}`, severity: 'note', code: 'INCLUDE_FOUND'
       });
     }
-    return calls;
+
+    const usesArduinoApi = scan.calls.some(call => ['pinMode', 'digitalWrite', 'digitalRead', 'Serial.begin'].includes(call.name));
+    if (usesArduinoApi && !includes.some(include => include === 'Arduino.h')) {
+      buckets.warnings.push({
+        file, line: 1, column: 1,
+        message: 'Arduino functions used but Arduino.h not explicitly included (may be auto-included)',
+        severity: 'warning', code: 'MISSING_ARDUINO_H'
+      });
+    }
   }
 
-  private isRequiredArduinoFunction(line: string): boolean {
-    return line.includes('void setup()') || line.includes('void loop()');
+  private checkCalls(
+    scan: SourceScanResult,
+    functions: TokenRange[],
+    loops: TokenRange[],
+    file: string,
+    rules: Set<string>,
+    buckets: AnalysisBuckets
+  ): void {
+    const callNames = new Set(scan.calls.map(call => call.name));
+    for (const call of scan.calls) {
+      const token = scan.tokens[call.tokenIndex];
+      const inLoop = loops.some(loop => containsToken(loop, call.tokenIndex));
+      const inSetup = functions.some(fn => fn.name === 'setup' && containsToken(fn, call.tokenIndex));
+
+      if (call.name === 'delay' && rules.has('delay-blocking')) {
+        buckets.warnings.push(this.diagnostic(file, token, 'delay() blocks execution. Consider using millis() for non-blocking timing.', 'warning', 'delay-blocking'));
+      }
+      if (call.name === 'delayMicroseconds' && rules.has('delay-microseconds-long')) {
+        const duration = numericArgument(scan, call, 0);
+        if (duration !== null && duration > 16383) {
+          buckets.notes.push(this.diagnostic(file, token, 'For delays > 16383us, consider using delay() or millis() instead', 'note', 'delay-microseconds-long'));
+        }
+      }
+      if (call.name === 'analogWrite' && rules.has('analog-write-range')) {
+        const value = numericArgument(scan, call, 1);
+        if (value !== null && (value < 0 || value > 255)) {
+          buckets.notes.push(this.diagnostic(file, token, 'analogWrite() value should be 0-255', 'note', 'analog-write-range'));
+        }
+      }
+      if (call.name === 'Serial.begin' && !inSetup) {
+        buckets.notes.push(this.diagnostic(file, token, 'Serial.begin() should typically be called in setup()', 'note', 'SERIAL_PLACEMENT'));
+      }
+      if (call.name === 'attachInterrupt' && rules.has('interrupt-caution')) {
+        buckets.notes.push(this.diagnostic(file, token, 'Interrupt handlers should be short. Avoid delay(), Serial, or long operations.', 'note', 'interrupt-caution'));
+      }
+      if (['digitalWrite', 'digitalRead'].includes(call.name)) {
+        const pin = numericArgument(scan, call, 0);
+        if (pin !== null) {
+          buckets.notes.push(this.diagnostic(file, token, `Using pin ${pin} - ensure pinMode() is set`, 'note', 'PIN_MODE_CHECK'));
+        }
+      }
+      if (call.name === 'pinMode' && numericArgument(scan, call, 0) !== null && rules.has('magic-number-pin')) {
+        buckets.notes.push(this.diagnostic(file, token, 'Consider using a named constant for pin numbers', 'note', 'magic-number-pin'));
+      }
+      if (call.name === 'digitalWrite' && inLoop && rules.has('frequent-digital-write')) {
+        buckets.notes.push(this.diagnostic(file, token, 'For faster I/O, consider direct port manipulation', 'note', 'frequent-digital-write'));
+      }
+      if (call.name === 'malloc' && rules.has('malloc-warning')) {
+        buckets.warnings.push(this.diagnostic(file, token, 'Dynamic memory allocation is risky on embedded systems. Consider static allocation.', 'warning', 'malloc-warning'));
+      }
+      if (call.name === 'WiFi.begin' && rules.has('esp32-wifi-begin')) {
+        buckets.notes.push(this.diagnostic(file, token, 'Consider calling WiFi.mode() before WiFi.begin() on ESP32', 'note', 'esp32-wifi-begin'));
+      }
+      if (call.name === 'xTaskCreate' && rules.has('esp32-task-stack')) {
+        buckets.notes.push(this.diagnostic(file, token, 'Ensure adequate stack size for xTaskCreate', 'note', 'esp32-task-stack'));
+      }
+      if (call.name.startsWith('HAL_') && rules.has('stm32-hal-init')) {
+        buckets.notes.push(this.diagnostic(file, token, 'Ensure HAL_Init() and clock configuration run before peripheral use', 'note', 'stm32-hal-init'));
+      }
+    }
+
+    if (callNames.has('noInterrupts') && !callNames.has('interrupts') && rules.has('no-interrupts-warning')) {
+      const call = scan.calls.find(item => item.name === 'noInterrupts')!;
+      buckets.warnings.push(this.diagnostic(file, scan.tokens[call.tokenIndex], 'Remember to call interrupts() after noInterrupts()', 'warning', 'no-interrupts-warning'));
+    }
   }
 
-  private extractFunctionName(line: string): string {
-    const match = line.match(/void\s+(\w+)\s*\(/);
-    return match ? match[1] : '';
+  private checkTokenRules(
+    scan: SourceScanResult,
+    loops: TokenRange[],
+    file: string,
+    rules: Set<string>,
+    buckets: AnalysisBuckets
+  ): void {
+    for (let index = 0; index < scan.tokens.length; index++) {
+      const token = scan.tokens[index];
+      const inLoop = loops.some(loop => containsToken(loop, index));
+      if (token.text === 'String' && scan.tokens[index + 1]?.kind === 'identifier' && rules.has('string-fragmentation')) {
+        buckets.warnings.push(this.diagnostic(file, token, 'String objects can cause memory fragmentation. Consider using char arrays.', 'warning', 'string-fragmentation'));
+      }
+      if (token.text === 'new' && rules.has('new-warning')) {
+        buckets.warnings.push(this.diagnostic(file, token, 'Dynamic memory allocation is risky on embedded systems. Consider static allocation.', 'warning', 'new-warning'));
+      }
+      if (token.text === 'float' && inLoop && rules.has('float-in-loop')) {
+        buckets.notes.push(this.diagnostic(file, token, 'Floating-point operations are slow on many Arduino boards.', 'note', 'float-in-loop'));
+      }
+      if (token.text === '%' && rules.has('modulo-power-of-two')) {
+        buckets.notes.push(this.diagnostic(file, token, 'For powers of 2, consider bitwise AND instead of modulo', 'note', 'modulo-power-of-two'));
+      }
+      if (token.text === '/' && rules.has('division-operation')) {
+        buckets.notes.push(this.diagnostic(file, token, 'Division can be slow; powers of 2 can use right shift', 'note', 'division-operation'));
+      }
+      if (token.kind === 'identifier' && scan.tokens[index + 1]?.text === '[' && rules.has('large-array')) {
+        const close = scan.delimiterPairs.get(index + 1);
+        const sizeToken = scan.tokens[index + 2];
+        if (close === index + 3 && sizeToken?.kind === 'number' && Number(sizeToken.text) >= 128) {
+          buckets.notes.push(this.diagnostic(file, token, 'Large arrays consume significant RAM. Consider PROGMEM for constant data.', 'note', 'large-array'));
+        }
+      }
+    }
   }
 
-  private isKeyword(word: string): boolean {
-    const keywords = ['if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 
-                     'return', 'int', 'float', 'double', 'char', 'bool', 'void', 'true', 'false'];
-    return keywords.includes(word);
-  }
-
-  private isArduinoBuiltin(word: string): boolean {
-    const builtins = ['pinMode', 'digitalWrite', 'digitalRead', 'analogRead', 'analogWrite', 
-                     'Serial', 'delay', 'millis', 'micros', 'HIGH', 'LOW', 'INPUT', 'OUTPUT', 
-                     'INPUT_PULLUP', 'LED_BUILTIN', 'setup', 'loop'];
-    return builtins.includes(word);
+  private deduplicate(buckets: AnalysisBuckets): void {
+    for (const key of ['errors', 'warnings', 'notes'] as const) {
+      const seen = new Set<string>();
+      buckets[key] = buckets[key].filter(item => {
+        const identity = `${item.line}:${item.column}:${item.code}:${item.message}`;
+        if (seen.has(identity)) return false;
+        seen.add(identity);
+        return true;
+      });
+    }
   }
 }

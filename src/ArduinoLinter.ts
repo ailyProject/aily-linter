@@ -4,8 +4,6 @@ import { DependencyAnalyzer } from './DependencyAnalyzer';
 import { LintCacheManager, LintCacheKey } from './LintCacheManager';
 import * as crypto from 'crypto';
 import { ParallelStaticAnalyzer, StaticAnalysisResult } from './ParallelStaticAnalyzer';
-import { AstGrepLinter, AstGrepLintResult, createArduinoLinter, createESP32Linter, LintOptions as AstGrepLintOptions } from './AstGrepLinter';
-import { getRuleSet } from './ArduinoLintRules';
 import { spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs-extra';
@@ -15,12 +13,12 @@ export interface LintError {
   file: string;
   line: number;
   column: number;
-  endLine?: number;      // 错误结束行（ast-grep 提供）
-  endColumn?: number;    // 错误结束列（ast-grep 提供）
+  endLine?: number;
+  endColumn?: number;
   message: string;
   severity: 'error' | 'warning' | 'note';
   code?: string;
-  fix?: {               // 自动修复建议（ast-grep 提供）
+  fix?: {
     range: [number, number];
     text: string;
   };
@@ -45,7 +43,7 @@ export interface LintOptions {
   boardOptions?: Record<string, string>;
   toolVersions?: string;
   format?: 'vscode' | 'json' | 'human';
-  mode?: 'fast' | 'accurate' | 'auto' | 'ast-grep';
+  mode?: 'fast' | 'accurate' | 'auto';
   ruleSet?: 'minimal' | 'standard' | 'strict' | 'esp32' | 'stm32';
   verbose?: boolean;
 }
@@ -63,7 +61,6 @@ export class ArduinoLinter {
   private dependencyAnalyzer: DependencyAnalyzer;
   private lintCacheManager: LintCacheManager;
   private staticAnalyzer: ParallelStaticAnalyzer;
-  private astGrepLinter: AstGrepLinter | null = null;
   private cache: Map<string, LintCache> = new Map(); // 向后兼容的内存缓存
 
   constructor(
@@ -73,59 +70,6 @@ export class ArduinoLinter {
     this.dependencyAnalyzer = new DependencyAnalyzer(logger);
     this.lintCacheManager = new LintCacheManager(logger);
     this.staticAnalyzer = new ParallelStaticAnalyzer(logger);
-  }
-
-  /**
-   * 获取或创建 ast-grep linter 实例
-   */
-  private getAstGrepLinter(board?: string): AstGrepLinter {
-    if (!this.astGrepLinter) {
-      // 根据开发板类型选择不同的 linter
-      if (board && board.toLowerCase().includes('esp32')) {
-        this.astGrepLinter = createESP32Linter(this.logger);
-      } else {
-        this.astGrepLinter = createArduinoLinter(this.logger);
-      }
-    }
-    return this.astGrepLinter;
-  }
-
-  /**
-   * 构建库搜索路径列表 - 用于 AstGrepLinter 符号提取
-   * 包括: SDK 核心路径、SDK 内置库路径、用户库路径
-   */
-  private buildLibrarySearchPaths(options: LintOptions): string[] {
-    const paths: string[] = [];
-    
-    // 1. 添加 SDK 路径下的核心和库目录
-    if (options.sdkPath) {
-      // ESP32 SDK 结构: {sdkPath}/cores/{variant}/, {sdkPath}/libraries/
-      const coresPath = path.join(options.sdkPath, 'cores');
-      const sdkLibrariesPath = path.join(options.sdkPath, 'libraries');
-      
-      if (fs.existsSync(coresPath)) {
-        paths.push(coresPath);
-      }
-      if (fs.existsSync(sdkLibrariesPath)) {
-        paths.push(sdkLibrariesPath);
-      }
-      
-      // 也添加 SDK 根目录（某些 SDK 头文件直接在根目录）
-      paths.push(options.sdkPath);
-    }
-    
-    // 2. 添加用户库路径
-    if (options.librariesPath && options.librariesPath.length > 0) {
-      for (const libPath of options.librariesPath) {
-        if (fs.existsSync(libPath)) {
-          paths.push(libPath);
-        }
-      }
-    }
-    
-    this.logger.verbose(`Library search paths for symbol extraction: ${paths.join(', ')}`);
-    
-    return paths;
   }
 
   /**
@@ -148,9 +92,6 @@ export class ArduinoLinter {
         case 'auto':
           return await this.performAutoAnalysis(options, startTime);
         
-        case 'ast-grep':
-          return await this.performAstGrepAnalysis(options, startTime);
-          
         default:
           throw new Error(`Unknown lint mode: ${mode}`);
       }
@@ -1080,7 +1021,10 @@ export class ArduinoLinter {
    * 快速静态分析模式 - 使用并行分析器
    */
   private async performFastAnalysis(options: LintOptions, startTime: number): Promise<LintResult> {
-    const analysisResult = await this.staticAnalyzer.analyzeFile(options.sketchPath);
+    const analysisResult = await this.staticAnalyzer.analyzeFile(options.sketchPath, {
+      board: options.board,
+      ruleSet: options.ruleSet
+    });
     
     return {
       success: analysisResult.errors.length === 0,
@@ -1089,56 +1033,6 @@ export class ArduinoLinter {
       notes: analysisResult.notes,
       executionTime: Date.now() - startTime
     };
-  }
-
-  /**
-   * ast-grep 高性能分析模式 - 基于 AST 的精确分析
-   */
-  private async performAstGrepAnalysis(options: LintOptions, startTime: number): Promise<LintResult> {
-    try {
-      // 读取源文件内容
-      const content = await fs.readFile(options.sketchPath, 'utf-8');
-      
-      // 获取 ast-grep linter（根据开发板类型自动选择规则集）
-      const linter = this.getAstGrepLinter(options.board);
-      
-      // 如果指定了规则集，更新规则
-      if (options.ruleSet) {
-        const rules = getRuleSet(options.ruleSet);
-        // 清除现有规则并添加新规则
-        for (const rule of rules) {
-          linter.addRule(rule);
-        }
-      }
-      
-      // 构建库路径列表用于符号提取
-      const astGrepOptions: AstGrepLintOptions = {
-        libraryPaths: this.buildLibrarySearchPaths(options)
-      };
-      
-      // 执行分析
-      const result = await linter.analyzeFile(options.sketchPath, content, astGrepOptions);
-      
-      this.logger.verbose(`ast-grep analysis completed in ${result.executionTime}ms`);
-      this.logger.verbose(`Found ${result.errors.length} errors, ${result.warnings.length} warnings, ${result.notes.length} notes`);
-      
-      return {
-        success: result.success,
-        errors: result.errors,
-        warnings: result.warnings,
-        notes: result.notes,
-        executionTime: Date.now() - startTime
-      };
-      
-    } catch (error) {
-      // 如果 ast-grep 不可用，回退到快速模式
-      if (error instanceof Error && error.message.includes('ast-grep/napi not installed')) {
-        this.logger.warn('ast-grep not available, falling back to fast mode');
-        return await this.performFastAnalysis(options, startTime);
-      }
-      
-      throw error;
-    }
   }
 
   /**
@@ -1258,7 +1152,10 @@ export class ArduinoLinter {
     
     // 执行并行静态分析
     this.logger.verbose('Starting parallel static analysis...');
-    const staticAnalysisResult = await this.staticAnalyzer.analyzeFile(options.sketchPath);
+    const staticAnalysisResult = await this.staticAnalyzer.analyzeFile(options.sketchPath, {
+      board: options.board,
+      ruleSet: options.ruleSet
+    });
     
     // 根据静态分析结果智能决策
     const needsCompilerCheck = this.shouldUseCompilerCheck(staticAnalysisResult, options);

@@ -2,8 +2,8 @@
 import { Command, InvalidArgumentError } from 'commander';
 import path from 'path';
 import os from 'os';
-import { ArduinoLinter, LintOptions } from './src/ArduinoLinter';
-import { ArduinoConfigParser } from './src/ArduinoConfigParser';
+import type { LintOptions, LintResult } from './src/ArduinoLinter';
+import { formatLintOutput } from './src/formatLintOutput';
 import { Logger } from './src/utils/Logger';
 import { calculateMD5 } from './src/utils/md5';
 
@@ -56,14 +56,14 @@ program
   .option('--build-property <key=value>', 'Additional build property; repeatable', collectKeyValue, {})
   .option('--board-options <key=value>', 'Board menu option; repeatable', collectKeyValue, {})
   .option('--tool-versions <versions>', 'Tool versions, e.g. gcc@12.2.0,esptool_py@4.8.1')
-  .option('--rule-set <name>', 'ast-grep rule set: minimal, standard, strict, esp32, stm32')
+  .option('--rule-set <name>', 'Fast rule set: minimal, standard, strict, esp32, stm32')
   .option('--format <format>', 'Output format: human, vscode, json', 'human')
-  .option('--mode <mode>', 'Analysis mode: fast, accurate, auto, ast-grep', 'fast')
+  .option('--mode <mode>', 'Analysis mode: fast, accurate, auto', 'fast')
   .option('--verbose', 'Enable verbose output', false)
   .addHelpText('after', `
 Examples:
   $ aily-linter sketch.ino
-  $ aily-linter sketch.ino --mode ast-grep --format vscode
+  $ aily-linter sketch.ino --mode fast --rule-set strict --format vscode
   $ aily-linter sketch.ino --mode accurate --sdk-path C:\\Arduino\\hardware\\avr
   $ aily-linter sketch.ino --libraries-path C:\\Arduino\\libraries --format json
 
@@ -71,14 +71,13 @@ Modes:
   fast      Lightweight static checks without invoking a compiler
   accurate  Compiler-based syntax and type validation
   auto      Fast checks first, then compiler validation when necessary
-  ast-grep  C++ AST rules powered by ast-grep
 `)
   .action(async (sketch: string, options) => {
     logger.setVerbose(Boolean(options.verbose));
     logger.setQuiet(options.format !== 'human');
 
     const validFormats = ['human', 'vscode', 'json'] as const;
-    const validModes = ['fast', 'accurate', 'auto', 'ast-grep'] as const;
+    const validModes = ['fast', 'accurate', 'auto'] as const;
     const validRuleSets = ['minimal', 'standard', 'strict', 'esp32', 'stm32'] as const;
 
     if (!validFormats.includes(options.format)) {
@@ -140,6 +139,29 @@ Modes:
     };
 
     try {
+      if (options.mode === 'fast') {
+        const started = Date.now();
+        const { ParallelStaticAnalyzer } = await import('./src/ParallelStaticAnalyzer');
+        const analysis = await new ParallelStaticAnalyzer(logger).analyzeFile(sketchPath, {
+          board: options.board,
+          ruleSet: options.ruleSet
+        });
+        const result: LintResult = {
+          success: analysis.errors.length === 0,
+          errors: analysis.errors,
+          warnings: analysis.warnings,
+          notes: analysis.notes,
+          executionTime: Date.now() - started
+        };
+        process.stdout.write(`${formatLintOutput(result, options.format)}\n`);
+        process.exitCode = result.success ? 0 : 1;
+        return;
+      }
+
+      const [{ ArduinoLinter }, { ArduinoConfigParser }] = await Promise.all([
+        import('./src/ArduinoLinter'),
+        import('./src/ArduinoConfigParser')
+      ]);
       const linter = new ArduinoLinter(logger, new ArduinoConfigParser());
       const result = await linter.lint(lintOptions);
       process.stdout.write(`${linter.formatOutput(result, options.format)}\n`);
