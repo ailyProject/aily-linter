@@ -1,5 +1,5 @@
 {
-  "name": "aily-linter",
+  "name": "@aily-project/aily-linter",
   "version": "1.0.0",
   "description": "Standalone multi-mode Arduino linter CLI",
   "main": "dist/main.js",

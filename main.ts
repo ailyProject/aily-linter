@@ -2,6 +2,7 @@
 import { Command, InvalidArgumentError } from 'commander';
 import path from 'path';
 import os from 'os';
+import packageJson from './package.json';
 import type { LintOptions, LintResult } from './src/ArduinoLinter';
 import { formatLintOutput } from './src/formatLintOutput';
 import { Logger } from './src/utils/Logger';
@@ -46,7 +47,7 @@ function getDefaultBuildPath(sketchPath: string): string {
 program
   .name('aily-linter')
   .description('Standalone multi-mode syntax analysis for Arduino sketches')
-  .version('1.0.0')
+  .version(packageJson.version)
   .argument('<sketch>', 'Path to an Arduino sketch (.ino file)')
   .option('-b, --board <board>', 'Target board FQBN', 'arduino:avr:uno')
   .option('--build-path <path>', 'Build output directory')
