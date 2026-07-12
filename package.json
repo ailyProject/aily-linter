@@ -14,6 +14,7 @@
   ],
   "scripts": {
     "build": "rimraf dist && tsc",
+    "bundle": "npm run build && node bundle.js",
     "check": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "benchmark": "npm run build && node bench/benchmark.js after",
@@ -37,6 +38,7 @@
   "devDependencies": {
     "@types/fs-extra": "^11.0.4",
     "@types/node": "^20.11.16",
+    "esbuild": "^0.28.1",
     "rimraf": "^5.0.5",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3"

@@ -10,6 +10,15 @@ npm run build
 node dist/main.js --help
 ```
 
+生成压缩后的单文件发布包：
+
+```powershell
+npm run bundle
+node dist/bundle-min/index.js --help
+```
+
+产物位于 `dist/bundle-min`，其中 `index.js` 是 CLI 入口，`aily-linter.js` 是由 esbuild 打包并压缩后的单文件代码。
+
 如需在本机注册 `aily-linter` 命令：
 
 ```powershell
