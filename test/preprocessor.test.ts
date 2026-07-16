@@ -57,3 +57,37 @@ test('ignores commented directives and supports logical line continuation', () =
   assert.deepEqual(result.includes, ['continued.h']);
   assert.equal(result.defines.has('WRONG'), false);
 });
+
+test('resolves __has_include with the active dependency search context', () => {
+  const result = analyzeSourceWithDefines(`
+#if __has_include("available.h")
+#include "available.h"
+#else
+#include "fallback.h"
+#endif
+`, new Map(), {
+    hasInclude(includePath) {
+      return includePath === 'available.h';
+    }
+  });
+
+  assert.deepEqual(result.includes, ['available.h']);
+  assert.equal(result.fallbackRequired, false);
+});
+
+test('expands GCC named variadic macros used as include operands', () => {
+  const result = analyzeSourceWithDefines(`
+#define SELECT_HEADER(header...) header
+#include SELECT_HEADER("selected.h")
+`, new Map());
+
+  assert.deepEqual(result.includes, ['selected.h']);
+});
+
+test('does not silently choose a branch for unsupported dependency conditions', () => {
+  assert.throws(() => analyzeSourceWithDefines(`
+#if sizeof(int) > 1
+#include "unsafe-choice.h"
+#endif
+`, new Map()), /requires a fallback/);
+});

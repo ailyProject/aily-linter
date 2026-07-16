@@ -1,17 +1,117 @@
 import { promises as fs } from 'fs';
-import { MacroDefinition } from './PreprocessorExpression';
-import { scanPreprocessor } from './PreprocessorScanner';
+import {
+    PreprocessorDirectiveTape,
+    PreprocessorScannerDiagnostic,
+    scanPreprocessorDirectives
+} from './PreprocessorDirectiveScanner';
+import {
+    DirectiveExecutionOptions,
+    PreprocessorExecutionDiagnostic,
+    PreprocessorIncludeEvent,
+    executeDirectiveTape
+} from './PreprocessorDirectiveExecutor';
+import type { MacroDefinition } from './PreprocessorExpression';
 
 export type { MacroDefinition } from './PreprocessorExpression';
+export type {
+    PreprocessorDirectiveTape,
+    PreprocessorScannerDiagnostic
+} from './PreprocessorDirectiveScanner';
+export type {
+    PreprocessorExecutionDiagnostic,
+    PreprocessorIncludeEvent
+} from './PreprocessorDirectiveExecutor';
+
+export type AnalysisDiagnostic =
+    | PreprocessorScannerDiagnostic
+    | PreprocessorExecutionDiagnostic;
 
 export interface AnalysisOptions {
     throwOnError?: boolean;
-    onInclude?: (includePath: string) => void;
+    /**
+     * Runs synchronously at the include location. Nested files may mutate the
+     * supplied macro Map before execution continues in the including file.
+     */
+    onInclude?: (includePath: string, event?: PreprocessorIncludeEvent) => void;
+    onPragmaOnce?: () => void;
+    onDiagnostic?: (diagnostic: AnalysisDiagnostic) => void;
+    hasInclude?: DirectiveExecutionOptions['hasInclude'];
+    /** Reuse a macro-independent scan result in another translation-unit state. */
+    tape?: PreprocessorDirectiveTape;
+    /**
+     * Migration/debug escape hatch. Production dependency analysis should keep
+     * this false so an unsupported active construct cannot silently lose edges.
+     */
+    allowIndeterminate?: boolean;
 }
-
 export interface AnalysisResult {
     includes: string[];
     defines: Map<string, MacroDefinition>;
+    includeEvents: PreprocessorIncludeEvent[];
+    diagnostics: AnalysisDiagnostic[];
+    fallbackRequired: boolean;
+    pragmaOnce: boolean;
+    tape: PreprocessorDirectiveTape;
+}
+
+function createFallbackError(
+    diagnostics: readonly AnalysisDiagnostic[],
+    sourceDescription: string
+): Error {
+    const first = diagnostics.find(diagnostic => diagnostic.severity === 'error')
+        || diagnostics[0];
+    const detail = first ? ': ' + first.message : '';
+    return new Error(
+        'Preprocessor dependency analysis requires a fallback for '
+        + sourceDescription
+        + detail
+    );
+}
+
+export function analyzeDirectiveTapeWithDefines(
+    tape: PreprocessorDirectiveTape,
+    defines: Map<string, MacroDefinition>,
+    options: AnalysisOptions = {},
+    sourceDescription = '<memory>'
+): AnalysisResult {
+    const execution = executeDirectiveTape(tape, defines, {
+        onInclude: (includePath, event) => options.onInclude?.(includePath, event),
+        onPragmaOnce: () => options.onPragmaOnce?.(),
+        onDiagnostic: diagnostic => options.onDiagnostic?.(diagnostic),
+        hasInclude: options.hasInclude
+    });
+    for (const diagnostic of tape.diagnostics) {
+        options.onDiagnostic?.(diagnostic);
+    }
+
+    const diagnostics: AnalysisDiagnostic[] = [
+        ...tape.diagnostics,
+        ...execution.diagnostics
+    ];
+    if (execution.fallbackRequired
+        && !options.allowIndeterminate
+        && options.throwOnError !== false) {
+        throw createFallbackError(diagnostics, sourceDescription);
+    }
+
+    return {
+        includes: execution.includes,
+        defines,
+        includeEvents: execution.includeEvents,
+        diagnostics,
+        fallbackRequired: execution.fallbackRequired,
+        pragmaOnce: execution.pragmaOnce,
+        tape
+    };
+}
+
+export function analyzeSourceWithDefines(
+    sourceCode: string | Buffer,
+    defines: Map<string, MacroDefinition>,
+    options: AnalysisOptions = {}
+): AnalysisResult {
+    const tape = options.tape || scanPreprocessorDirectives(sourceCode);
+    return analyzeDirectiveTapeWithDefines(tape, defines, options);
 }
 
 export async function analyzeFile(
@@ -19,15 +119,8 @@ export async function analyzeFile(
     defines: Map<string, MacroDefinition>,
     options: AnalysisOptions = {}
 ): Promise<string[]> {
-    return (await analyzeFileWithDefines(filePath, defines, options)).includes;
-}
-
-export function analyzeSourceWithDefines(
-    sourceCode: string,
-    defines: Map<string, MacroDefinition>,
-    options: AnalysisOptions = {}
-): AnalysisResult {
-    return scanPreprocessor(sourceCode, defines, options);
+    const result = await analyzeFileWithDefines(filePath, defines, options);
+    return result.includes;
 }
 
 export async function analyzeFileWithDefines(
@@ -37,20 +130,26 @@ export async function analyzeFileWithDefines(
 ): Promise<AnalysisResult> {
     try {
         if (!filePath || typeof filePath !== 'string') {
-            throw new Error('文件路径不能为空');
+            throw new Error('File path must not be empty');
         }
 
-        let sourceCode: string;
-        try {
-            sourceCode = await fs.readFile(filePath, 'utf8');
-        } catch (error) {
-            throw new Error(`无法读取文件 ${filePath}: ${(error as Error).message}`);
-        }
-
-        return analyzeSourceWithDefines(sourceCode, defines, options);
+        const source = await fs.readFile(filePath);
+        const tape = options.tape || scanPreprocessorDirectives(source);
+        return analyzeDirectiveTapeWithDefines(tape, defines, options, filePath);
     } catch (error) {
-        if (options.throwOnError !== false) throw error;
-        console.error(`分析文件 ${filePath} 时出错:`, (error as Error).message);
-        return { includes: [], defines };
+        if (options.throwOnError !== false) {
+            throw error;
+        }
+
+        const tape = options.tape || scanPreprocessorDirectives(Buffer.alloc(0));
+        return {
+            includes: [],
+            defines,
+            includeEvents: [],
+            diagnostics: [],
+            fallbackRequired: true,
+            pragmaOnce: false,
+            tape
+        };
     }
 }
