@@ -14,7 +14,8 @@ import { Logger } from './utils/Logger';
 import type { MacroDefinition } from './utils/PreprocessorExpression';
 
 const SCHEMA_VERSION = 3;
-const ANALYZER_VERSION = 'library-include-graph-v8';
+export const DEPENDENCY_ANALYZER_VERSION = 'dependency-directive-tape-v2';
+const ANALYZER_VERSION = DEPENDENCY_ANALYZER_VERSION;
 const STAT_CONCURRENCY = 32;
 
 interface FileSnapshot {
@@ -89,12 +90,13 @@ export class LibraryIndexCache {
     libraryName: string,
     libraryPath: string,
     macroDefinitions: Map<string, MacroDefinition>,
-    builder: () => Promise<LibraryIndexBuildResult>
+    builder: () => Promise<LibraryIndexBuildResult>,
+    analysisContext: string = ''
   ): Promise<LibraryIndexResult> {
     const startedAt = Date.now();
     const normalizedLibraryPath = this.normalizePath(libraryPath);
     const pathStatePath = this.getPathStatePath(normalizedLibraryPath);
-    const macroKey = this.createMacroKey(macroDefinitions);
+    const macroKey = this.createMacroKey(macroDefinitions, analysisContext);
     const files = await this.collectFiles(libraryPath);
     const fastFingerprint = this.createFastFingerprint(files);
     const cachedPathState = await this.readPathState(pathStatePath);
@@ -364,8 +366,12 @@ export class LibraryIndexCache {
     await Promise.all(workers);
   }
 
-  private createMacroKey(macroDefinitions: Map<string, MacroDefinition>): string {
+  private createMacroKey(
+    macroDefinitions: Map<string, MacroDefinition>,
+    analysisContext: string
+  ): string {
     const hash = createHash('sha256');
+    hash.update(`analysis-context=${analysisContext}\n`);
     const entries = Array.from(macroDefinitions.entries())
       .map(([name, macro]) => `${name}=${this.getMacroCacheKeyValue(macro)}|${this.getMacroShapeKey(macro)}`)
       .sort();
@@ -488,7 +494,17 @@ export class LibraryIndexCache {
   }
 
   private getSourceIndexPath(sourceHash: string): string {
-    return path.join(this.cacheDir, 'sources', sourceHash.substring(0, 2), `${sourceHash}.json`);
+    const analyzerNamespace = createHash('sha256')
+      .update(ANALYZER_VERSION)
+      .digest('hex')
+      .substring(0, 16);
+    return path.join(
+      this.cacheDir,
+      'sources',
+      analyzerNamespace,
+      sourceHash.substring(0, 2),
+      `${sourceHash}.json`
+    );
   }
 
   private async readPathState(cachePath: string): Promise<CachedPathState | null> {
