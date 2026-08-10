@@ -14,8 +14,11 @@ export interface LintCacheKey {
   boardOptions: string;
   sourceFile: string;
   fileContentHash?: string; // 文件内容哈希，用于检测文件变化
+  toolVersions?: string;
   mode?: string;
 }
+
+const LINT_CACHE_SCHEMA_VERSION = 2;
 
 export class LintCacheManager {
   private cacheDir: string;
@@ -48,7 +51,7 @@ export class LintCacheManager {
    * 生成缓存键的MD5值
    */
   private generateCacheKey(cacheKey: LintCacheKey): string {
-    const keyString = `${cacheKey.operation}|${cacheKey.board}|${cacheKey.sdkPath}|${cacheKey.toolsPath}|${cacheKey.librariesPath}|${cacheKey.buildProperties}|${cacheKey.boardOptions}|${cacheKey.sourceFile}|${cacheKey.mode || ''}`;
+    const keyString = `${cacheKey.operation}|${cacheKey.board}|${cacheKey.sdkPath}|${cacheKey.toolsPath}|${cacheKey.librariesPath}|${cacheKey.buildProperties}|${cacheKey.boardOptions}|${cacheKey.sourceFile}|${cacheKey.fileContentHash || ''}|${cacheKey.toolVersions || ''}|${cacheKey.mode || ''}`;
     const hash = createHash('md5').update(keyString).digest('hex');
     return hash;
   }
@@ -123,8 +126,9 @@ export class LintCacheManager {
 
       // 添加缓存时间戳
       const cacheData = {
-        ...data,
-        cachedAt: Date.now()
+        schemaVersion: LINT_CACHE_SCHEMA_VERSION,
+        cachedAt: Date.now(),
+        data
       };
 
       // 直接写入JSON文件
@@ -152,8 +156,12 @@ export class LintCacheManager {
       this.logger.debug(`Retrieved ${cacheKey.operation} cache for ${path.basename(cacheKey.sourceFile)}`);
       
       // 移除内部时间戳
+      if (cacheData.schemaVersion === LINT_CACHE_SCHEMA_VERSION
+        && Object.prototype.hasOwnProperty.call(cacheData, 'data')) {
+        return cacheData.data;
+      }
+
       delete cacheData.cachedAt;
-      
       return cacheData;
     } catch (error) {
       this.logger.debug(`Failed to retrieve ${cacheKey.operation} cache: ${error instanceof Error ? error.message : error}`);

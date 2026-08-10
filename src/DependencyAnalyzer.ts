@@ -7,7 +7,7 @@ import fs from 'fs-extra';
 import * as path from 'path';
 import { glob } from 'glob';
 import { Logger } from './utils/Logger';
-import { analyzeDirectiveTapeWithDefines, analyzeFile } from './utils/AnalyzeFile';
+import { analyzeDirectiveTapeWithDefines } from './utils/AnalyzeFile';
 import {
   PreprocessorDirectiveFlags,
   PreprocessorDirectiveOpcode,
@@ -229,9 +229,7 @@ export class DependencyAnalyzer {
 
     // Analyze after the library map exists so __has_include queries the same
     // dependency search universe used by resolveDependencies().
-    const mainIncludeFiles = await analyzeFile(sketchPath, this.macroDefinitions, {
-      hasInclude: includePath => this.canResolveKnownInclude(includePath, sketchPath)
-    });
+    const mainIncludeFiles = this.analyzeSketchTranslationUnit(sketchPath);
 
     // 5. 递归分析依赖，resolveA用于确定是否处理预编译库
     let resolveA = arduinoConfig.platform['compiler.libraries.ldflags'] ? true : false;
@@ -357,6 +355,60 @@ export class DependencyAnalyzer {
       arduinoConfig.fqbnParsed?.boardId || '',
       ...this.platformHeaderRoots.map(root => this.normalizeAnalysisPath(root))
     ].join('|');
+  }
+
+  private analyzeSketchTranslationUnit(sketchPath: string): string[] {
+    const externalIncludes = new Set<string>();
+    const activeIncludeStack = new Set<string>();
+    const onceFiles = new Set<string>();
+    const normalize = (filePath: string): string => {
+      const resolved = path.resolve(filePath).replace(/\\/g, '/');
+      return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+    };
+
+    const resolveLocalInclude = (includePath: string, includingFilePath: string): string | undefined => {
+      const candidates = [
+        path.resolve(path.dirname(includingFilePath), includePath),
+        path.resolve(path.dirname(sketchPath), includePath)
+      ];
+      return candidates.find(candidate => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
+    };
+
+    const analyzeLocalFile = (filePath: string): void => {
+      const normalizedPath = normalize(filePath);
+      if (activeIncludeStack.has(normalizedPath) || onceFiles.has(normalizedPath)) return;
+
+      activeIncludeStack.add(normalizedPath);
+      try {
+        const tape = scanPreprocessorDirectives(fs.readFileSync(filePath));
+        analyzeDirectiveTapeWithDefines(tape, this.macroDefinitions, {
+          onPragmaOnce: () => onceFiles.add(normalizedPath),
+          hasInclude: includePath => !!resolveLocalInclude(includePath, filePath)
+            || this.canResolveKnownInclude(includePath, filePath),
+          onInclude: includePath => {
+            const localPath = resolveLocalInclude(includePath, filePath);
+            if (localPath) analyzeLocalFile(localPath);
+            else externalIncludes.add(includePath);
+          }
+        }, filePath);
+      } finally {
+        activeIncludeStack.delete(normalizedPath);
+      }
+    };
+
+    const sketchExtension = path.extname(sketchPath).toLowerCase();
+    const sketchFiles = ['.ino', '.pde'].includes(sketchExtension)
+      ? [
+          sketchPath,
+          ...fs.readdirSync(path.dirname(sketchPath), { withFileTypes: true })
+            .filter(entry => entry.isFile() && ['.ino', '.pde'].includes(path.extname(entry.name).toLowerCase()))
+            .map(entry => path.resolve(path.dirname(sketchPath), entry.name))
+            .filter(filePath => normalize(filePath) !== normalize(sketchPath))
+            .sort((left, right) => path.basename(left).localeCompare(path.basename(right)))
+        ]
+      : [sketchPath];
+    for (const sketchFile of sketchFiles) analyzeLocalFile(sketchFile);
+    return [...externalIncludes];
   }
 
   private normalizeAnalysisPath(filePath: string): string {
@@ -567,15 +619,13 @@ export class DependencyAnalyzer {
     }
 
     for (const includeFile of includeFiles) {
-      // 跳过系统头文件
-      if (this.isSystemHeader(includeFile)) {
-        this.logger.debug(`Skipping system header: ${includeFile}`);
-        continue;
-      }
+      const libraryKey = this.libraryMap.has(includeFile)
+        ? includeFile
+        : this.libraryMap.has(path.basename(includeFile)) ? path.basename(includeFile) : null;
 
-      if (this.libraryMap.has(includeFile)) {
+      if (libraryKey) {
         // 库存在
-        const libraryObject = this.libraryMap.get(includeFile)
+        const libraryObject = this.libraryMap.get(libraryKey)
         this.logger.debug(`Found library for ${includeFile}: ${libraryObject.name}`);
 
         if (this.dependencyList.has(libraryObject.name)) {
@@ -598,6 +648,8 @@ export class DependencyAnalyzer {
         }
 
         await this.resolveDependencies(libraryIndex.includeFiles, resolveA, depth + 1, maxDepth, libraryIndex.macroDefinitions || macroDefinitions)
+      } else if (this.isSystemHeader(includeFile)) {
+        this.logger.debug(`Skipping system header: ${includeFile}`);
       } else {
         this.logger.verbose(`Not found ${includeFile}`);
       }
