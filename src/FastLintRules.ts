@@ -26,8 +26,8 @@ const PERFORMANCE_RULES = [
 const STYLE_RULES = ['magic-number-pin', 'empty-setup', 'empty-loop'];
 
 const BOARD_RULES: Record<'esp32' | 'stm32', string[]> = {
-  esp32: ['esp32-wifi-begin', 'esp32-task-stack', 'esp32-dual-core', 'esp32-watchdog', 'esp32-gpio-isr'],
-  stm32: ['stm32-hal-init', 'stm32-clock-config']
+  esp32: ['esp32-wifi-begin', 'esp32-task-stack'],
+  stm32: ['stm32-hal-init']
 };
 
 export function getFastRuleIds(ruleSet: FastRuleSetName = 'standard'): Set<string> {

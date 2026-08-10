@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { ParallelStaticAnalyzer } from '../src/ParallelStaticAnalyzer';
+import { FastStaticAnalyzer } from '../src/FastStaticAnalyzer';
 import { Logger } from '../src/utils/Logger';
 import { scanSource } from '../src/utils/SourceScanner';
 
@@ -40,7 +40,7 @@ void loop() {
 `);
 
   try {
-    const analyzer = new ParallelStaticAnalyzer(new Logger());
+    const analyzer = new FastStaticAnalyzer(new Logger());
     const minimal = await analyzer.analyzeFile(file, { ruleSet: 'minimal' });
     const standard = await analyzer.analyzeFile(file, { ruleSet: 'standard' });
     assert.equal(minimal.warnings.filter(item => item.code === 'delay-blocking').length, 1);

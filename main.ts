@@ -70,8 +70,8 @@ Examples:
 
 Modes:
   fast      Lightweight static checks without invoking a compiler
-  accurate  Compiler-based syntax and type validation
-  auto      Fast checks first, then compiler validation when necessary
+  accurate  Arduino sketch preprocessing plus compiler validation
+  auto      Fast checks plus mandatory compiler validation
 `)
   .action(async (sketch: string, options) => {
     logger.setVerbose(Boolean(options.verbose));
@@ -142,8 +142,8 @@ Modes:
     try {
       if (options.mode === 'fast') {
         const started = Date.now();
-        const { ParallelStaticAnalyzer } = await import('./src/ParallelStaticAnalyzer');
-        const analysis = await new ParallelStaticAnalyzer(logger).analyzeFile(sketchPath, {
+        const { FastStaticAnalyzer } = await import('./src/FastStaticAnalyzer');
+        const analysis = await new FastStaticAnalyzer(logger).analyzeFile(sketchPath, {
           board: options.board,
           ruleSet: options.ruleSet
         });

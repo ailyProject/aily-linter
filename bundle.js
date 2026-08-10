@@ -63,9 +63,11 @@ require('./aily-linter.js');
 async function createPackageJson() {
   const projectPackageJson = await fs.readJson('./package.json');
   const bundlePackageJson = {
-    name: projectPackageJson.name,
+    name: `${projectPackageJson.name}-bundle`,
     version: projectPackageJson.version,
-    description: projectPackageJson.description,
+    private: true,
+    description: `${projectPackageJson.description} (standalone bundle)`,
+    license: projectPackageJson.license,
     main: 'index.js',
     bin: {
       'aily-linter': 'index.js',
@@ -73,6 +75,7 @@ async function createPackageJson() {
     engines: {
       node: projectPackageJson.engines?.node || '>=18',
     },
+    ailyLinterDistribution: 'standalone-bundle',
   };
 
   await fs.writeFile(
