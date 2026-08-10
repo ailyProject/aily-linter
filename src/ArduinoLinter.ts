@@ -3,11 +3,13 @@ import { ArduinoConfigParser } from './ArduinoConfigParser';
 import { DependencyAnalyzer } from './DependencyAnalyzer';
 import { LintCacheManager, LintCacheKey } from './LintCacheManager';
 import * as crypto from 'crypto';
-import { ParallelStaticAnalyzer, StaticAnalysisResult } from './ParallelStaticAnalyzer';
-import { spawn } from 'child_process';
+import { FastStaticAnalyzer, StaticAnalysisResult } from './FastStaticAnalyzer';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 import * as os from 'os';
+import { preprocessArduinoSketch } from './ArduinoSketchPreprocessor';
+import { parseCompilerDiagnostics } from './CompilerDiagnosticParser';
+import { CompilerExecutionResult, runCompilerCommand } from './CompilerProcessRunner';
 
 export interface LintError {
   file: string;
@@ -46,22 +48,19 @@ export interface LintOptions {
   mode?: 'fast' | 'accurate' | 'auto';
   ruleSet?: 'minimal' | 'standard' | 'strict' | 'esp32' | 'stm32';
   verbose?: boolean;
+  /** Internal snapshot of sketch-local inputs used to keep one lint run cache-consistent. */
+  cacheInputHash?: string;
 }
 
 // 缓存结构
 interface LintCache {
-  libraryPaths?: string[];
-  includePaths?: string[];
-  config?: Record<string, any>;
   dependencies?: any[];
-  lastModified?: number;
 }
 
 export class ArduinoLinter {
   private dependencyAnalyzer: DependencyAnalyzer;
   private lintCacheManager: LintCacheManager;
-  private staticAnalyzer: ParallelStaticAnalyzer;
-  private cache: Map<string, LintCache> = new Map(); // 向后兼容的内存缓存
+  private staticAnalyzer: FastStaticAnalyzer;
 
   constructor(
     private logger: Logger,
@@ -69,7 +68,7 @@ export class ArduinoLinter {
   ) {
     this.dependencyAnalyzer = new DependencyAnalyzer(logger);
     this.lintCacheManager = new LintCacheManager(logger);
-    this.staticAnalyzer = new ParallelStaticAnalyzer(logger);
+    this.staticAnalyzer = new FastStaticAnalyzer(logger);
   }
 
   /**
@@ -78,19 +77,23 @@ export class ArduinoLinter {
   async lint(options: LintOptions): Promise<LintResult> {
     const startTime = Date.now();
     const mode = options.mode || 'fast';
+    const effectiveOptions = mode === 'fast'
+      ? options
+      : { ...options, cacheInputHash: await this.calculateSketchInputHash(options.sketchPath, options.buildPath) };
     
     try {
+      this.configureEnvironment(effectiveOptions);
       this.logger.verbose(`Starting ${mode} syntax analysis...`);
       
       switch (mode) {
         case 'fast':
-          return await this.performFastAnalysis(options, startTime);
+          return await this.performFastAnalysis(effectiveOptions, startTime);
           
         case 'accurate':
-          return await this.performCompilerAnalysis(options, startTime);
+          return await this.performCompilerAnalysis(effectiveOptions, startTime);
           
         case 'auto':
-          return await this.performAutoAnalysis(options, startTime);
+          return await this.performAutoAnalysis(effectiveOptions, startTime);
         
         default:
           throw new Error(`Unknown lint mode: ${mode}`);
@@ -115,332 +118,7 @@ export class ArduinoLinter {
     }
   }
 
-  // /**
-  //  * 获取预处理后的文件 - 简化版本，直接进行静态语法检查
-  //  */
-  // private async getPreprocessedFile(options: LintOptions): Promise<string> {
-  //   // 创建临时目录
-  //   const tempDir = path.join(os.tmpdir(), `aily-lint-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`);
-  //   await fs.ensureDir(tempDir);
-    
-  //   const preprocessedPath = path.join(tempDir, 'sketch.cpp');
-    
-  //   try {
-  //     this.logger.verbose(`Performing static syntax analysis...`);
-      
-  //     // 直接转换 sketch 为 C++ 并进行基本语法检查
-  //     await this.createSimpleCppFile(options.sketchPath, preprocessedPath);
-      
-  //     return preprocessedPath;
-  //   } catch (error) {
-  //     // 清理临时目录
-  //     await fs.remove(tempDir).catch(() => {});
-  //     throw error;
-  //   }
-  // }
 
-  /**
-   * 创建简单的 C++ 文件用于语法检查
-   */
-  // private async createSimpleCppFile(
-  //   sketchPath: string, 
-  //   outputPath: string
-  // ): Promise<void> {
-  //   // 读取原始 sketch 文件
-  //   const sketchContent = await fs.readFile(sketchPath, 'utf-8');
-    
-  //   // 生成简化的 C++ 代码用于语法检查
-  //   const cppContent = this.convertSketchToCpp(sketchContent);
-    
-  //   // 写入输出文件
-  //   await fs.writeFile(outputPath, cppContent);
-  // }
-
-  /**
-   * 将 Arduino sketch 转换为标准 C++
-   */
-  // private convertSketchToCpp(sketchContent: string): string {
-  //   // 添加 Arduino 核心头文件
-  //   let cppContent = '#include <Arduino.h>\n\n';
-    
-  //   // 简单的函数前向声明检测和添加
-  //   const functionDeclarations = this.extractFunctionDeclarations(sketchContent);
-  //   if (functionDeclarations.length > 0) {
-  //     cppContent += functionDeclarations.join('\n') + '\n\n';
-  //   }
-    
-  //   // 添加原始代码
-  //   cppContent += sketchContent;
-    
-  //   return cppContent;
-  // }
-
-  /**
-   * 提取函数前向声明
-   */
-  // private extractFunctionDeclarations(content: string): string[] {
-  //   const declarations: string[] = [];
-    
-  //   // 简单的函数定义匹配（不包括 setup/loop）
-  //   const functionRegex = /^((?:static\s+)?(?:inline\s+)?(?:const\s+)?[a-zA-Z_][a-zA-Z0-9_*&\s]+\s+)([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)\s*\{/gm;
-    
-  //   let match;
-  //   while ((match = functionRegex.exec(content)) !== null) {
-  //     const [, returnType, funcName] = match;
-      
-  //     // 跳过 setup 和 loop 函数
-  //     if (funcName === 'setup' || funcName === 'loop') {
-  //       continue;
-  //     }
-      
-  //     // 提取参数列表
-  //     const startPos = match.index + match[0].indexOf('(');
-  //     const paramMatch = content.slice(startPos).match(/\([^)]*\)/);
-      
-  //     if (paramMatch) {
-  //       const params = paramMatch[0];
-  //       declarations.push(`${returnType.trim()} ${funcName}${params};`);
-  //     }
-  //   }
-    
-  //   return declarations;
-  // }
-
-  /**
-   * 构建语法检查命令
-   */
-  // private async buildSyntaxCheckCommand(
-  //   preprocessedFile: string,
-  //   options: LintOptions
-  // ): Promise<string> {
-  //   // 获取平台配置
-  //   const result = await this.configParser.parseByFQBN(options.board, {}, {});
-  //   const config = { ...result.platform, ...result.board };
-    
-  //   // 获取编译器路径和基础参数
-  //   let compileCmd = config['recipe.cpp.o.pattern'] || config['recipe.c.o.pattern'];
-    
-  //   if (!compileCmd) {
-  //     throw new Error('Cannot find compiler recipe in platform configuration');
-  //   }
-    
-  //   // 替换变量
-  //   compileCmd = this.replaceVariables(compileCmd, {
-  //     ...config,
-  //     source_file: preprocessedFile,
-  //     object_file: '' // 不需要输出文件
-  //   });
-    
-  //   // 修改为语法检查模式
-  //   compileCmd = compileCmd
-  //     .replace(/-c\s+/g, '-fsyntax-only ')  // 替换 -c 为 -fsyntax-only
-  //     .replace(/-o\s+[^\s]+/g, '')          // 移除 -o output.o
-  //     .replace(/-MMD\s*/g, '')              // 移除依赖生成
-  //     .replace(/-MP\s*/g, '');
-    
-  //   // 添加诊断选项
-  //   compileCmd += ' -fdiagnostics-color=always';
-  //   compileCmd += ' -fmax-errors=50'; // 限制错误数量，避免输出过多
-    
-  //   // 如果支持 JSON 输出格式（GCC 9+）
-  //   if (options.format === 'json') {
-  //     compileCmd += ' -fdiagnostics-format=json';
-  //   }
-    
-  //   this.logger.verbose(`Syntax check command: ${compileCmd}`);
-    
-  //   return compileCmd;
-  // }
-
-  /**
-   * 替换命令中的变量
-   */
-  // private replaceVariables(command: string, vars: Record<string, string>): string {
-  //   let result = command;
-    
-  //   for (const [key, value] of Object.entries(vars)) {
-  //     const pattern = new RegExp(`\\{${key}\\}`, 'g');
-  //     let normalizedValue = value || '';
-  //     // 规范化路径，去除双斜杠
-  //     normalizedValue = normalizedValue.replace(/\/\/+/g, '/').replace(/\\\\+/g, '\\');
-  //     result = result.replace(pattern, normalizedValue);
-  //   }
-    
-  //   return result;
-  // }
-
-  /**
-   * 执行语法检查命令
-   */
-  // private async executeSyntaxCheck(command: string): Promise<string> {
-  //   return new Promise((resolve, reject) => {
-  //     const parts = command.split(/\s+/);
-  //     const executable = parts[0];
-  //     const args = parts.slice(1);
-      
-  //     let stdout = '';
-  //     let stderr = '';
-      
-  //     const childProcess = spawn(executable, args, {
-  //       shell: true,
-  //       env: { ...process.env, LANG: 'en_US.UTF-8' } // 确保英文输出
-  //     });
-      
-  //     childProcess.stdout?.on('data', (data) => {
-  //       stdout += data.toString();
-  //     });
-      
-  //     childProcess.stderr?.on('data', (data) => {
-  //       stderr += data.toString();
-  //     });
-      
-  //     childProcess.on('close', (code) => {
-  //       // 语法检查即使有错误也会返回非0，这是正常的
-  //       // 我们需要解析输出而不是依赖退出码
-  //       resolve(stderr + stdout);
-  //     });
-      
-  //     childProcess.on('error', (error) => {
-  //       reject(new Error(`Failed to execute syntax check: ${error.message}`));
-  //     });
-  //   });
-  // }
-
-  /**
-   * 解析编译器输出
-   */
-  // private parseCompilerOutput(
-  //   output: string,
-  //   format: 'vscode' | 'json' | 'human' = 'human'
-  // ): Omit<LintResult, 'success' | 'executionTime'> {
-  //   const errors: LintError[] = [];
-  //   const warnings: LintError[] = [];
-  //   const notes: LintError[] = [];
-    
-  //   // 尝试 JSON 格式解析
-  //   if (format === 'json') {
-  //     try {
-  //       const diagnostics = this.parseJsonOutput(output);
-  //       return this.categorizeDiagnostics(diagnostics);
-  //     } catch (e) {
-  //       this.logger.debug('JSON parsing failed, falling back to text parsing');
-  //     }
-  //   }
-    
-  //   // 文本格式解析
-  //   return this.parseTextOutput(output);
-  // }
-
-  /**
-   * 解析 JSON 格式输出（GCC 9+）
-   */
-  // private parseJsonOutput(output: string): LintError[] {
-  //   const diagnostics: LintError[] = [];
-    
-  //   // GCC JSON 输出是一行一个 JSON 对象
-  //   const lines = output.split('\n').filter(line => line.trim().startsWith('{'));
-    
-  //   for (const line of lines) {
-  //     try {
-  //       const diag = JSON.parse(line);
-        
-  //       if (diag.kind && diag.locations && diag.message) {
-  //         const location = diag.locations[0] || {};
-          
-  //         diagnostics.push({
-  //           file: location.file || '',
-  //           line: location.line || 0,
-  //           column: location.column || 0,
-  //           message: diag.message,
-  //           severity: this.mapSeverity(diag.kind),
-  //           code: diag.option || undefined
-  //         });
-  //       }
-  //     } catch (e) {
-  //       // 跳过无效的 JSON 行
-  //       continue;
-  //     }
-  //   }
-    
-  //   return diagnostics;
-  // }
-
-  /**
-   * 解析文本格式输出
-   */
-  // private parseTextOutput(output: string): Omit<LintResult, 'success' | 'executionTime'> {
-  //   const errors: LintError[] = [];
-  //   const warnings: LintError[] = [];
-  //   const notes: LintError[] = [];
-    
-  //   // 匹配格式：
-  //   // file.cpp:15:23: error: expected ';' before '}' token
-  //   // file.cpp:20:5: warning: unused variable 'x' [-Wunused-variable]
-  //   const diagnosticRegex = /^(.+?):(\d+):(\d+):\s+(error|warning|note):\s+(.+?)(?:\s+\[(.+?)\])?$/gm;
-    
-  //   let match;
-  //   while ((match = diagnosticRegex.exec(output)) !== null) {
-  //     const [, file, line, col, severity, message, code] = match;
-      
-  //     const diagnostic: LintError = {
-  //       file: this.normalizeFilePath(file),
-  //       line: parseInt(line),
-  //       column: parseInt(col),
-  //       message: message.trim(),
-  //       severity: this.mapSeverity(severity),
-  //       code: code || undefined
-  //     };
-      
-  //     if (diagnostic.severity === 'error') {
-  //       errors.push(diagnostic);
-  //     } else if (diagnostic.severity === 'warning') {
-  //       warnings.push(diagnostic);
-  //     } else {
-  //       notes.push(diagnostic);
-  //     }
-  //   }
-    
-  //   return { errors, warnings, notes };
-  // }
-
-  /**
-   * 分类诊断信息
-   */
-  // private categorizeDiagnostics(
-  //   diagnostics: LintError[]
-  // ): Omit<LintResult, 'success' | 'executionTime'> {
-  //   const errors = diagnostics.filter(d => d.severity === 'error');
-  //   const warnings = diagnostics.filter(d => d.severity === 'warning');
-  //   const notes = diagnostics.filter(d => d.severity === 'note');
-    
-  //   return { errors, warnings, notes };
-  // }
-
-  /**
-   * 映射严重性级别
-   */
-  // private mapSeverity(severity: string): 'error' | 'warning' | 'note' {
-  //   switch (severity.toLowerCase()) {
-  //     case 'error':
-  //     case 'fatal error':
-  //       return 'error';
-  //     case 'warning':
-  //       return 'warning';
-  //     case 'note':
-  //     case 'info':
-  //       return 'note';
-  //     default:
-  //       return 'note';
-  //   }
-  // }
-
-  /**
-   * 标准化文件路径
-   */
-  // private normalizeFilePath(filePath: string): string {
-  //   // 移除 Windows 盘符后的不必要前缀
-  //   return path.normalize(filePath.trim());
-  // }
 
   /**
    * 格式化输出结果
@@ -557,469 +235,38 @@ export class ArduinoLinter {
     return lines.join('\n');
   }
 
-  /**
-   * 构建预处理器命令
-   */
-  // private buildPreprocessorCommand(
-  //   sketchPath: string,
-  //   outputPath: string,
-  //   config: Record<string, any>
-  // ): string {
-  //   // 获取编译器路径 - 使用更完整的路径构建
-  //   const compilerCmd = config['compiler.cpp.cmd'] || 'g++';
-  //   const compilerPath = config['compiler.path'] || '';
-  //   const toolsPath = config['runtime.tools.arm-none-eabi-gcc.path'] || '';
-    
-  //   // 尝试多种路径组合
-  //   let fullCompilerPath: string;
-  //   if (toolsPath && compilerCmd.includes('arm-none-eabi')) {
-  //     fullCompilerPath = path.join(toolsPath, 'bin', compilerCmd);
-  //   } else if (compilerPath) {
-  //     fullCompilerPath = path.join(compilerPath, compilerCmd);
-  //   } else {
-  //     fullCompilerPath = compilerCmd;
-  //   }
-    
-  //   // 构建预处理命令
-  //   let cmd = `"${fullCompilerPath}" -E`; // -E 表示只进行预处理
-    
-  //   // 添加基本选项
-  //   cmd += ` -w`; // 抑制警告
-  //   cmd += ` -std=gnu++17`; // C++ 标准
-  //   cmd += ` -fpermissive`; // 允许一些宽松的语法
-    
-  //   // 添加定义
-  //   const defines = [
-  //     `-DARDUINO=${config['runtime.ide.version'] || '10607'}`,
-  //     `-DARDUINO_${config['build.board'] || 'UNKNOWN'}`,
-  //     `-DARDUINO_ARCH_${config['build.arch']?.toUpperCase() || 'UNKNOWN'}`
-  //   ];
-  //   cmd += ` ${defines.join(' ')}`;
-    
-  //   // 添加核心头文件路径
-  //   const corePath = config['runtime.platform.path'] ? 
-  //     path.join(config['runtime.platform.path'], 'cores', config['build.core'] || 'arduino') :
-  //     '';
-  //   if (corePath && fs.existsSync(corePath)) {
-  //     cmd += ` -I"${corePath}"`;
-  //   }
-    
-  //   // 添加变体头文件路径
-  //   const variantPath = config['runtime.platform.path'] ? 
-  //     path.join(config['runtime.platform.path'], 'variants', config['build.variant'] || 'standard') :
-  //     '';
-  //   if (variantPath && fs.existsSync(variantPath)) {
-  //     cmd += ` -I"${variantPath}"`;
-  //   }
-    
-  //   return cmd;
-  // }
 
-  /**
-   * 运行预处理器
-   */
-  // private async runPreprocessor(
-  //   preprocessorCmd: string,
-  //   inputFile: string,
-  //   outputFile: string
-  // ): Promise<void> {
-  //   const fullCmd = `${preprocessorCmd} "${inputFile}" -o "${outputFile}"`;
-    
-  //   return new Promise((resolve, reject) => {
-  //     const childProcess = spawn(fullCmd, [], {
-  //       shell: true,
-  //       stdio: ['ignore', 'pipe', 'pipe']
-  //     });
-      
-  //     let stderr = '';
-      
-  //     childProcess.stderr?.on('data', (data) => {
-  //       stderr += data.toString();
-  //     });
-      
-  //     childProcess.on('close', (code) => {
-  //       if (code === 0) {
-  //         resolve();
-  //       } else {
-  //         reject(new Error(`Preprocessing failed: ${stderr}`));
-  //       }
-  //     });
-      
-  //     childProcess.on('error', (error) => {
-  //       reject(new Error(`Failed to run preprocessor: ${error.message}`));
-  //     });
-  //   });
-  // }
+  /** Configure the environment consumed by config and dependency analysis. */
+  private configureEnvironment(options: LintOptions): void {
+    const sketchPath = path.resolve(options.sketchPath);
+    process.env['SKETCH_PATH'] = sketchPath;
+    process.env['SKETCH_NAME'] = path.basename(sketchPath, path.extname(sketchPath));
+    process.env['SKETCH_DIR_PATH'] = path.dirname(sketchPath);
+    process.env['BUILD_PATH'] = options.buildPath;
+    if (options.sdkPath) process.env['SDK_PATH'] = options.sdkPath;
+    if (options.toolsPath) process.env['TOOLS_PATH'] = options.toolsPath;
+    if (options.librariesPath) {
+      process.env['LIBRARIES_PATH'] = options.librariesPath.join(path.delimiter);
+    }
+  }
 
-  /**
-   * 执行静态语法分析
-   */
-  // private async performStaticSyntaxAnalysis(sketchPath: string): Promise<{
-  //   errors: LintError[];
-  //   warnings: LintError[];
-  //   notes: LintError[];
-  // }> {
-  //   const errors: LintError[] = [];
-  //   const warnings: LintError[] = [];
-  //   const notes: LintError[] = [];
-    
-  //   try {
-  //     // 读取文件内容
-  //     const content = await fs.readFile(sketchPath, 'utf-8');
-  //     const lines = content.split('\n');
-      
-  //     // 执行各种语法检查
-  //     this.checkBraces(lines, sketchPath, errors);
-  //     this.checkSemicolons(lines, sketchPath, errors, warnings);
-  //     this.checkVariableDeclarations(lines, sketchPath, warnings);
-  //     this.checkFunctionSyntax(lines, sketchPath, errors, warnings);
-  //     this.checkArduinoSpecific(lines, sketchPath, warnings, notes);
-      
-  //   } catch (error) {
-  //     errors.push({
-  //       file: sketchPath,
-  //       line: 0,
-  //       column: 0,
-  //       message: `Failed to read file: ${error instanceof Error ? error.message : error}`,
-  //       severity: 'error'
-  //     });
-  //   }
-    
-  //   return { errors, warnings, notes };
-  // }
+  private parseToolVersions(toolVersions?: string): Record<string, string> {
+    const parsed: Record<string, string> = {};
+    for (const pair of toolVersions?.split(',') || []) {
+      const separator = pair.lastIndexOf('@');
+      if (separator <= 0 || separator === pair.length - 1) continue;
+      parsed[pair.slice(0, separator).trim()] = pair.slice(separator + 1).trim();
+    }
+    return parsed;
+  }
 
-  /**
-   * 检查大括号匹配
-   */
-  // private checkBraces(lines: string[], filePath: string, errors: LintError[]): void {
-  //   const braceStack: { line: number; char: string; column: number }[] = [];
-    
-  //   lines.forEach((line, lineIndex) => {
-  //     for (let i = 0; i < line.length; i++) {
-  //       const char = line[i];
-  //       const prevChar = i > 0 ? line[i - 1] : '';
-  //       const nextChar = i < line.length - 1 ? line[i + 1] : '';
-        
-  //       // 跳过字符串和注释中的括号
-  //       if (this.isInStringOrComment(line, i)) continue;
-        
-  //       if (char === '{' || char === '(' || char === '[') {
-  //         braceStack.push({ line: lineIndex + 1, char, column: i + 1 });
-  //       } else if (char === '}' || char === ')' || char === ']') {
-  //         const expected = char === '}' ? '{' : char === ')' ? '(' : '[';
-          
-  //         if (braceStack.length === 0) {
-  //           errors.push({
-  //             file: filePath,
-  //             line: lineIndex + 1,
-  //             column: i + 1,
-  //             message: `Unexpected '${char}' - no matching opening bracket`,
-  //             severity: 'error'
-  //           });
-  //         } else {
-  //           const last = braceStack.pop()!;
-  //           if (last.char !== expected) {
-  //             errors.push({
-  //               file: filePath,
-  //               line: lineIndex + 1,
-  //               column: i + 1,
-  //               message: `Mismatched bracket: expected '${this.getClosingBrace(last.char)}' but found '${char}'`,
-  //               severity: 'error'
-  //             });
-  //           }
-  //         }
-  //       }
-  //     }
-  //   });
-    
-  //   // 检查未关闭的括号
-  //   braceStack.forEach(brace => {
-  //     errors.push({
-  //       file: filePath,
-  //       line: brace.line,
-  //       column: brace.column,
-  //       message: `Unmatched '${brace.char}' - missing closing '${this.getClosingBrace(brace.char)}'`,
-  //       severity: 'error'
-  //     });
-  //   });
-  // }
+  private getMergedBuildProperties(options: LintOptions): Record<string, string> {
+    return {
+      ...(options.buildProperties || {}),
+      ...(options.boardOptions || {})
+    };
+  }
 
-  /**
-   * 检查分号
-   */
-  // private checkSemicolons(lines: string[], filePath: string, errors: LintError[], warnings: LintError[]): void {
-  //   for (let i = 0; i < lines.length; i++) {
-  //     const line = lines[i];
-  //     const trimmed = line.trim();
-      
-  //     // 跳过空行、注释行、预处理指令
-  //     if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('/*') || 
-  //         trimmed.startsWith('*') || trimmed.startsWith('#')) {
-  //       continue;
-  //     }
-      
-  //     // 跳过控制结构、函数定义等不需要分号的行
-  //     if (this.isControlStructure(trimmed) || this.isFunctionDefinition(trimmed) || 
-  //         trimmed.endsWith('{') || trimmed.endsWith('}')) {
-  //       continue;
-  //     }
-      
-  //     // 检查是否是链式调用的一部分
-  //     if (this.isPartOfChainedCall(lines, i)) {
-  //       continue;
-  //     }
-      
-  //     // 检查是否缺少分号
-  //     if (this.shouldEndWithSemicolon(trimmed) && !trimmed.endsWith(';')) {
-  //       errors.push({
-  //         file: filePath,
-  //         line: i + 1,
-  //         column: line.length,
-  //         message: `Expected ';' at end of statement`,
-  //         severity: 'error'
-  //       });
-  //     }
-  //   }
-  // }
-
-  /**
-   * 检查变量声明
-   */
-  // private checkVariableDeclarations(lines: string[], filePath: string, warnings: LintError[]): void {
-  //   const declaredVars = new Set<string>();
-  //   const usedVars = new Set<string>();
-    
-  //   lines.forEach((line, lineIndex) => {
-  //     const trimmed = line.trim();
-      
-  //     // 检查变量声明
-  //     const varDecl = this.extractVariableDeclaration(trimmed);
-  //     if (varDecl) {
-  //       declaredVars.add(varDecl);
-  //     }
-      
-  //     // 检查变量使用
-  //     const usedVar = this.extractVariableUsage(trimmed);
-  //     if (usedVar) {
-  //       usedVars.add(usedVar);
-  //     }
-  //   });
-    
-  //   // 检查未声明的变量使用（基础检查）
-  //   usedVars.forEach(varName => {
-  //     if (!declaredVars.has(varName) && !this.isArduinoBuiltin(varName)) {
-  //       warnings.push({
-  //         file: filePath,
-  //         line: 1, // 简化：标记在第一行
-  //         column: 1,
-  //         message: `Possibly undeclared variable: '${varName}'`,
-  //         severity: 'warning'
-  //       });
-  //     }
-  //   });
-  // }
-
-  /**
-   * 检查函数语法
-   */
-  // private checkFunctionSyntax(lines: string[], filePath: string, errors: LintError[], warnings: LintError[]): void {
-  //   lines.forEach((line, lineIndex) => {
-  //     const trimmed = line.trim();
-      
-  //     // 检查函数调用语法
-  //     const funcCallMatch = trimmed.match(/(\w+)\s*\(/);
-  //     if (funcCallMatch) {
-  //       const funcName = funcCallMatch[1];
-        
-  //       // 检查是否有匹配的右括号
-  //       const openCount = (trimmed.match(/\(/g) || []).length;
-  //       const closeCount = (trimmed.match(/\)/g) || []).length;
-        
-  //       if (openCount !== closeCount) {
-  //         errors.push({
-  //           file: filePath,
-  //           line: lineIndex + 1,
-  //           column: trimmed.indexOf('(') + 1,
-  //           message: `Unmatched parentheses in function call '${funcName}'`,
-  //           severity: 'error'
-  //         });
-  //       }
-  //     }
-  //   });
-  // }
-
-  /**
-   * 检查 Arduino 特定语法
-   */
-  // private checkArduinoSpecific(lines: string[], filePath: string, warnings: LintError[], notes: LintError[]): void {
-  //   let hasSetup = false;
-  //   let hasLoop = false;
-    
-  //   lines.forEach((line, lineIndex) => {
-  //     const trimmed = line.trim();
-      
-  //     if (trimmed.includes('void setup(')) {
-  //       hasSetup = true;
-  //     }
-  //     if (trimmed.includes('void loop(')) {
-  //       hasLoop = true;
-  //     }
-  //   });
-    
-  //   if (!hasSetup) {
-  //     warnings.push({
-  //       file: filePath,
-  //       line: 1,
-  //       column: 1,
-  //       message: `Missing 'setup()' function - required for Arduino sketches`,
-  //       severity: 'warning'
-  //     });
-  //   }
-    
-  //   if (!hasLoop) {
-  //     warnings.push({
-  //       file: filePath,
-  //       line: 1,
-  //       column: 1,
-  //       message: `Missing 'loop()' function - required for Arduino sketches`,
-  //       severity: 'warning'
-  //     });
-  //   }
-  // }
-
-  // 辅助方法
-  // private isInStringOrComment(line: string, position: number): boolean {
-  //   // 简单实现：检查是否在字符串或单行注释中
-  //   const beforePos = line.substring(0, position);
-  //   const stringCount = (beforePos.match(/"/g) || []).length;
-  //   const commentPos = line.indexOf('//');
-    
-  //   return (stringCount % 2 === 1) || (commentPos !== -1 && position >= commentPos);
-  // }
-
-  // private getClosingBrace(openBrace: string): string {
-  //   switch (openBrace) {
-  //     case '{': return '}';
-  //     case '(': return ')';
-  //     case '[': return ']';
-  //     default: return '';
-  //   }
-  // }
-
-  // private isControlStructure(line: string): boolean {
-  //   const keywords = ['if', 'else', 'while', 'for', 'switch', 'case', 'default', 'do'];
-  //   return keywords.some(keyword => 
-  //     line.startsWith(keyword + ' ') || line.startsWith(keyword + '(')
-  //   );
-  // }
-
-  // private isFunctionDefinition(line: string): boolean {
-  //   return /^\s*\w+\s+\w+\s*\([^)]*\)\s*$/.test(line) || 
-  //          /^\s*\w+\s+\w+\s*\([^)]*\)\s*\{/.test(line);
-  // }
-
-  // private shouldEndWithSemicolon(line: string): boolean {
-  //   // 简单规则：赋值、函数调用、变量声明等应该以分号结尾
-  //   return /^\s*\w/.test(line) && 
-  //          !line.endsWith('{') && 
-  //          !line.endsWith('}') &&
-  //          !this.isControlStructure(line);
-  // }
-
-  /**
-   * 检查是否是链式调用的一部分
-   */
-  // private isPartOfChainedCall(lines: string[], currentIndex: number): boolean {
-  //   const currentLine = lines[currentIndex].trim();
-    
-  //   // 如果当前行以点开头，说明是链式调用的延续
-  //   if (currentLine.startsWith('.')) {
-  //     return true;
-  //   }
-    
-  //   // 检查当前行是否可能是链式调用的开始
-  //   // 如果下一行以点开头，当前行就是链式调用的开始
-  //   if (currentIndex + 1 < lines.length) {
-  //     const nextLine = lines[currentIndex + 1].trim();
-  //     if (nextLine.startsWith('.')) {
-  //       return true;
-  //     }
-  //   }
-    
-  //   // 检查当前行是否是多行表达式的一部分
-  //   // 如果当前行包含函数调用但没有分号，且下一行缩进，可能是链式调用
-  //   if (currentLine.includes('(') && !currentLine.endsWith(';') && !currentLine.endsWith('{') && !currentLine.endsWith('}')) {
-  //     if (currentIndex + 1 < lines.length) {
-  //       const nextLine = lines[currentIndex + 1];
-  //       const currentIndent = this.getIndentation(lines[currentIndex]);
-  //       const nextIndent = this.getIndentation(nextLine);
-        
-  //       // 如果下一行缩进更多，或者以点开头，说明是链式调用
-  //       if (nextIndent > currentIndent || nextLine.trim().startsWith('.')) {
-  //         return true;
-  //       }
-  //     }
-  //   }
-    
-  //   return false;
-  // }
-
-  /**
-   * 获取行的缩进级别
-   */
-  // private getIndentation(line: string): number {
-  //   const match = line.match(/^(\s*)/);
-  //   return match ? match[1].length : 0;
-  // }
-
-  // private extractVariableDeclaration(line: string): string | null {
-  //   const match = line.match(/^\s*(int|float|double|char|bool|String|byte)\s+(\w+)/);
-  //   return match ? match[2] : null;
-  // }
-
-  // private extractVariableUsage(line: string): string | null {
-  //   const match = line.match(/\b(\w+)\s*[=+\-*/]/);
-  //   return match ? match[1] : null;
-  // }
-
-  // private isArduinoBuiltin(varName: string): boolean {
-  //   const builtins = [
-  //     'HIGH', 'LOW', 'INPUT', 'OUTPUT', 'INPUT_PULLUP',
-  //     'LED_BUILTIN', 'A0', 'A1', 'A2', 'A3', 'A4', 'A5',
-  //     'Serial', 'pinMode', 'digitalWrite', 'digitalRead', 'analogRead', 'analogWrite',
-  //     'delay', 'delayMicroseconds', 'millis', 'micros'
-  //   ];
-  //   return builtins.includes(varName);
-  // }
-
-  /**
-   * 格式化静态分析结果
-   */
-  // private formatStaticAnalysisResults(
-  //   issues: { errors: LintError[]; warnings: LintError[]; notes: LintError[] },
-  //   format: string
-  // ): string {
-  //   // 创建临时 LintResult 用于格式化
-  //   const result: LintResult = {
-  //     success: issues.errors.length === 0,
-  //     errors: issues.errors,
-  //     warnings: issues.warnings,
-  //     notes: issues.notes,
-  //     executionTime: 0 // 临时值
-  //   };
-    
-  //   if (format === 'json') {
-  //     return JSON.stringify(issues, null, 2);
-  //   } else if (format === 'vscode') {
-  //     return this.formatVSCode(result);
-  //   } else {
-  //     return this.formatHuman(result);
-  //   }
-  // }
-
-  /**
-   * 快速静态分析模式 - 使用并行分析器
-   */
   private async performFastAnalysis(options: LintOptions, startTime: number): Promise<LintResult> {
     const analysisResult = await this.staticAnalyzer.analyzeFile(options.sketchPath, {
       board: options.board,
@@ -1070,24 +317,13 @@ export class ArduinoLinter {
       }
 
       // === 解析工具版本（与 ArduinoCompiler 保持一致）===
-      let toolVersions: { [key: string]: string } = {};
-      if (options.toolVersions) {
-        // 解析工具版本字符串，格式: tool1@version1,tool2@version2
-        const toolVersionPairs = options.toolVersions.split(',');
-        for (const pair of toolVersionPairs) {
-          const [tool, version] = pair.trim().split('@');
-          if (tool && version) {
-            toolVersions[tool] = version;
-            this.logger.verbose(`Tool version: ${tool}@${version}`);
-          }
-        }
+      const toolVersions = this.parseToolVersions(options.toolVersions);
+      for (const [tool, version] of Object.entries(toolVersions)) {
+        this.logger.verbose(`Tool version: ${tool}@${version}`);
       }
 
       // === 合并构建属性（与 ArduinoCompiler 保持一致）===
-      const buildProperties = {
-        ...(options.buildProperties || {}),
-        ...(options.boardOptions || {}) // 将 board-options 合并到 build-properties
-      };
+      const buildProperties = this.getMergedBuildProperties(options);
       
       this.logger.verbose(`Build properties for lint: ${JSON.stringify(buildProperties)}`);
 
@@ -1108,7 +344,13 @@ export class ArduinoLinter {
         const compilerResult = await this.executeCompilerSyntaxCheck(cppFile, config, options, arduinoConfig);
         
         // 5. 解析编译器输出
-        const issues = this.parseCompilerErrors(compilerResult, options.sketchPath);
+        this.logger.verbose(`Parsing compiler output: ${compilerResult.output}`);
+        const issues = parseCompilerDiagnostics(
+          compilerResult.output,
+          options.sketchPath,
+          compilerResult.exitCode,
+          compilerResult.signal
+        );
         
         const result = {
           success: issues.errors.length === 0,
@@ -1136,51 +378,27 @@ export class ArduinoLinter {
   }
 
   /**
-   * 自动模式：智能决策是否需要编译器检查
+   * 自动模式：合并快速规则结果与强制编译器语义验证结果。
    */
   private async performAutoAnalysis(options: LintOptions, startTime: number): Promise<LintResult> {
-    // 首先检查编译器分析缓存
-    const cachedCompilerResult = await this.getCachedCompilerResult(options);
-    if (cachedCompilerResult) {
-      this.logger.verbose('Using cached compiler analysis result');
-      cachedCompilerResult.executionTime = Date.now() - startTime;
-      return cachedCompilerResult;
-    }
-    
-    // 生成缓存键（向后兼容）
-    const cacheKey = this.generateCacheKey(options);
-    
-    // 执行并行静态分析
-    this.logger.verbose('Starting parallel static analysis...');
+    // 先执行轻量静态分析，再使用编译器验证语义正确性。
+    this.logger.verbose('Starting static analysis...');
     const staticAnalysisResult = await this.staticAnalyzer.analyzeFile(options.sketchPath, {
       board: options.board,
       ruleSet: options.ruleSet
     });
     
-    // 根据静态分析结果智能决策
-    const needsCompilerCheck = this.shouldUseCompilerCheck(staticAnalysisResult, options);
+    // auto 必须完成语义验证；fast 的置信度只描述启发式扫描质量，
+    // 不能证明符号、类型或重载解析正确。
+    this.logger.verbose(`Static analysis confidence: ${staticAnalysisResult.confidence}; running compiler validation`);
     
-    if (!needsCompilerCheck) {
-      this.logger.verbose(`Static analysis confidence: ${staticAnalysisResult.confidence}, skipping compiler check`);
-      return {
-        success: staticAnalysisResult.errors.length === 0,
-        errors: staticAnalysisResult.errors,
-        warnings: staticAnalysisResult.warnings,
-        notes: staticAnalysisResult.notes,
-        executionTime: Date.now() - startTime
-      };
-    }
-    
-    // 需要编译器检查：并行获取配置和依赖
-    this.logger.verbose(`Static analysis suggests compiler check needed (confidence: ${staticAnalysisResult.confidence})`);
-    
-    const parallelTasks = await this.performParallelPreparation(options, cacheKey);
+    const compilerPreparation = await this.prepareCompilerAnalysis(options);
     
     const resetStartTime = Date.now(); // 重置计时，只计算编译器检查时间
     
     try {
       // 使用准备好的数据进行编译器分析
-      const accurateResult = await this.performOptimizedCompilerAnalysis(options, parallelTasks.cachedData, resetStartTime);
+      const accurateResult = await this.performOptimizedCompilerAnalysis(options, compilerPreparation.cachedData, resetStartTime);
       
       // 合并静态分析和编译器分析的结果
       const mergedResult = this.mergeAnalysisResults(staticAnalysisResult, accurateResult);
@@ -1188,11 +406,18 @@ export class ArduinoLinter {
       
       return mergedResult;
     } catch (error) {
-      // 如果编译器检查失败，回退到静态分析结果
+      // 编译器不可用时不能把仅经过启发式检查的结果标记为成功。
       this.logger.verbose(`Compiler analysis failed: ${error instanceof Error ? error.message : error}`);
       return {
-        success: staticAnalysisResult.errors.length === 0,
-        errors: staticAnalysisResult.errors,
+        success: false,
+        errors: [...staticAnalysisResult.errors, {
+          file: options.sketchPath,
+          line: 1,
+          column: 1,
+          message: `Auto mode could not complete compiler validation: ${error instanceof Error ? error.message : error}`,
+          severity: 'error',
+          code: 'AUTO_COMPILER_VALIDATION_FAILED'
+        }],
         warnings: staticAnalysisResult.warnings,
         notes: staticAnalysisResult.notes,
         executionTime: Date.now() - startTime
@@ -1233,9 +458,11 @@ export class ArduinoLinter {
    * 生成预处理后的 C++ 文件
    */
   private async generateCppFile(sketchPath: string, tempDir: string): Promise<string> {
-    const sketchContent = await fs.readFile(sketchPath, 'utf-8');
-    // const cppContent = this.convertSketchToCpp(sketchContent);
-    const cppContent = sketchContent; // 简化处理，直接使用草图内容作为 C++ 内容
+    const preprocessedSketch = await preprocessArduinoSketch(sketchPath);
+    const cppContent = preprocessedSketch.content;
+    this.logger.verbose(
+      `Preprocessed ${preprocessedSketch.sourceFiles.length} sketch file(s) with ${preprocessedSketch.generatedPrototypes.length} generated prototype(s)`
+    );
     
     const cppFile = path.join(tempDir, 'sketch.cpp');
     await fs.writeFile(cppFile, cppContent, 'utf-8');
@@ -1247,7 +474,7 @@ export class ArduinoLinter {
    * 执行编译器语法检查
    * 使用 platform.txt 中的 recipe.cpp.o.pattern 来确保与实际编译一致
    */
-  private async executeCompilerSyntaxCheck(cppFile: string, config: Record<string, any>, options: LintOptions, arduinoConfig: any): Promise<string> {
+  private async executeCompilerSyntaxCheck(cppFile: string, config: Record<string, any>, options: LintOptions, arduinoConfig: any): Promise<CompilerExecutionResult> {
     // 获取编译 recipe
     let compileCmd = config['recipe.cpp.o.pattern'] || config['recipe.c.o.pattern'];
     if (!compileCmd) {
@@ -1314,274 +541,16 @@ export class ArduinoLinter {
     this.logger.verbose(cppContent);
     this.logger.verbose('------- END -------');
     
-    return new Promise(async (resolve, reject) => {
-      try {
-        // 解析编译命令，分离可执行文件和参数
-        const cmdMatch = compileCmd.match(/^"([^"]+)"\s+(.*)$/) || compileCmd.match(/^(\S+)\s+(.*)$/);
-        if (!cmdMatch) {
-          reject(new Error('Invalid compile command format'));
-          return;
-        }
-        
-        const executable = cmdMatch[1];
-        const argsString = cmdMatch[2];
-        
-        // 使用改进的参数解析方法
-        let args = this.parseCommandArgsImproved(argsString);
-        
-        // 检查命令行长度，如果太长则使用响应文件
-        const totalLength = executable.length + args.join(' ').length;
-        this.logger.verbose(`Total command length: ${totalLength} characters`);
-        
-        // Windows 命令行限制通常是 8191 字符，我们设置为 7000 作为安全边际
-        if (totalLength > 7000) {
-          this.logger.verbose('Command line too long, using response file');
-          
-          // 创建响应文件
-          const responseFilePath = path.join(path.dirname(cppFile), 'compile_args.txt');
-          
-          // 找到所有 -I 参数和 @ 参数并移动到响应文件
-          const responseArgs: string[] = [];
-          const filteredArgs: string[] = [];
-          
-          for (let i = 0; i < args.length; i++) {
-            if (args[i].startsWith('-I') || args[i].startsWith('@')) {
-              responseArgs.push(args[i]);
-            } else {
-              filteredArgs.push(args[i]);
-            }
-          }
-          
-          // 将所有参数写入响应文件
-          const responseFileContent = responseArgs.join('\n');
-          await fs.writeFile(responseFilePath, responseFileContent);
-          
-          // 添加我们的响应文件参数到过滤后的参数开头
-          filteredArgs.unshift(`@${responseFilePath}`);
-          
-          args = filteredArgs;
-          
-          this.logger.verbose(`Created response file: ${responseFilePath}`);
-          this.logger.verbose(`Response file contains ${responseArgs.length} arguments`);
-          this.logger.verbose(`Response file first 5 lines:`);
-          const firstLines = responseArgs.slice(0, 5);
-          firstLines.forEach(line => this.logger.verbose(`  ${line}`));
-          this.logger.verbose(`New command length: ${executable.length + args.join(' ').length} characters`);
-        }
-        
-        this.logger.verbose(`Executable: ${executable}`);
-        this.logger.verbose(`Args: ${JSON.stringify(args)}`);
-        
-        const { spawn } = require('child_process');
-        const childProcess = spawn(executable, args, {
-          stdio: ['ignore', 'pipe', 'pipe']
-        });
-        
-        let stdout = '';
-        let stderr = '';
-        
-        childProcess.stdout?.on('data', (data) => {
-          stdout += data.toString();
-        });
-        
-        childProcess.stderr?.on('data', (data) => {
-          stderr += data.toString();
-        });
-        
-        childProcess.on('close', (code) => {
-          // 调试信息
-          this.logger.verbose(`Compiler exit code: ${code}`);
-          this.logger.verbose(`Compiler stdout: ${stdout}`);
-          this.logger.verbose(`Compiler stderr: ${stderr}`);
-          
-          // GCC 语法检查：code 0 = 成功，非0 = 有语法错误
-          resolve(stderr || stdout); // 错误信息通常在 stderr
-        });
-        
-        childProcess.on('error', (error) => {
-          reject(new Error(`Failed to run compiler: ${error.message}`));
-        });
-      } catch (error) {
-        reject(error);
-      }
-    });
+    return runCompilerCommand(compileCmd, cppFile, this.logger);
   }
 
-  /**
-   * 改进的命令行参数解析
-   */
-  private parseCommandArgsImproved(argsString: string): string[] {
-    const args: string[] = [];
-    let currentArg = '';
-    let inSingleQuotes = false;
-    let inDoubleQuotes = false;
-    let i = 0;
-    
-    while (i < argsString.length) {
-      const char = argsString[i];
-      
-      if (char === "'" && !inDoubleQuotes) {
-        inSingleQuotes = !inSingleQuotes;
-      } else if (char === '"' && !inSingleQuotes) {
-        inDoubleQuotes = !inDoubleQuotes;
-      } else if (char === ' ' && !inSingleQuotes && !inDoubleQuotes) {
-        if (currentArg.trim()) {
-          args.push(currentArg.trim());
-          currentArg = '';
-        }
-      } else {
-        currentArg += char;
-      }
-      i++;
-    }
-    
-    if (currentArg.trim()) {
-      args.push(currentArg.trim());
-    }
-    
-    return args;
-  }
 
-  /**
-   * 解析命令行参数
-   */
-  // private parseCommandArgs(argsString: string): string[] {
-  //   const args: string[] = [];
-  //   let currentArg = '';
-  //   let inQuotes = false;
-  //   let i = 0;
-    
-  //   while (i < argsString.length) {
-  //     const char = argsString[i];
-      
-  //     if (char === '"' && (i === 0 || argsString[i - 1] !== '\\')) {
-  //       inQuotes = !inQuotes;
-  //       // 对于路径参数，移除包围的引号，保留内容
-  //       if (!inQuotes && currentArg.startsWith('"')) {
-  //         // 结束引号，移除开始和结束的引号
-  //         // 不添加结束引号
-  //       } else if (inQuotes) {
-  //         // 开始引号，不添加到结果中
-  //       } else {
-  //         currentArg += char;
-  //       }
-  //     } else if (char === "'" && !inQuotes) {
-  //       // 处理单引号包围的参数（如 '-DUSB_MANUFACTURER="Arduino LLC"'）
-  //       let j = i + 1;
-  //       let singleQuotedArg = "";
-        
-  //       while (j < argsString.length && argsString[j] !== "'") {
-  //         singleQuotedArg += argsString[j];
-  //         j++;
-  //       }
-        
-  //       if (j < argsString.length) {
-  //         // 移除外层单引号，保留内容
-  //         if (currentArg.trim()) {
-  //           args.push(currentArg.trim());
-  //           currentArg = '';
-  //         }
-  //         args.push(singleQuotedArg);
-  //         i = j; // 跳过单引号区域
-  //       } else {
-  //         currentArg += char;
-  //       }
-  //     } else if (char === ' ' && !inQuotes) {
-  //       if (currentArg.trim()) {
-  //         args.push(currentArg.trim());
-  //         currentArg = '';
-  //       }
-  //     } else {
-  //       currentArg += char;
-  //     }
-  //     i++;
-  //   }
-    
-  //   if (currentArg.trim()) {
-  //     args.push(currentArg.trim());
-  //   }
-    
-  //   return args;
-  // }
-
-  /**
-   * 获取编译器路径
-   * 参考 ArduinoConfigParser 中的做法：compiler.path + compiler.cpp.cmd
-   */
-  // private getCompilerPath(config: Record<string, any>): string {
-  //   const compilerPath = config['compiler.path'] || '';
-  //   const compilerCmd = config['compiler.cpp.cmd'] || 'g++';
-    
-  //   // 首先尝试使用 ArduinoConfigParser 设置的环境变量
-  //   if (process.env['COMPILER_GPP_PATH']) {
-  //     this.logger.verbose(`Using COMPILER_GPP_PATH from environment: ${process.env['COMPILER_GPP_PATH']}`);
-  //     return process.env['COMPILER_GPP_PATH'];
-  //   }
-    
-  //   // 如果有 compiler.path，直接拼接（这是 platform.txt 的标准方式）
-  //   if (compilerPath) {
-  //     // 正确处理路径分隔符，避免双斜杠问题
-  //     let fullPath = compilerPath;
-  //     if (!fullPath.endsWith('/') && !fullPath.endsWith('\\')) {
-  //       fullPath += '/';
-  //     }
-  //     fullPath += compilerCmd;
-      
-  //     // 规范化路径，处理双斜杠等问题
-  //     fullPath = path.normalize(fullPath);
-      
-  //     this.logger.verbose(`Constructed compiler path: ${fullPath}`);
-      
-  //     // 检查文件是否存在
-  //     if (fs.existsSync(fullPath)) {
-  //       return fullPath;
-  //     } else {
-  //       this.logger.verbose(`Compiler not found at: ${fullPath}`);
-  //     }
-  //   }
-    
-  //   // 尝试多种工具路径配置（后备方案）
-  //   const possibleToolsPaths = [
-  //     config['runtime.tools.arm-none-eabi-gcc.path'],
-  //     config['runtime.tools.gcc-arm-none-eabi.path'],
-  //     config['runtime.tools.xpack-arm-none-eabi-gcc-14.2.1-1.1.path']
-  //   ].filter(Boolean);
-    
-  //   for (const toolsPath of possibleToolsPaths) {
-  //     if (compilerCmd.includes('arm-none-eabi')) {
-  //       // ARM 编译器通常在 bin 子目录
-  //       const fullPath = path.join(toolsPath, 'bin', compilerCmd);
-  //       if (fs.existsSync(fullPath)) {
-  //         this.logger.verbose(`Found compiler at: ${fullPath}`);
-  //         return fullPath;
-  //       }
-        
-  //       // 有些版本可能直接在工具目录
-  //       const directPath = path.join(toolsPath, compilerCmd);
-  //       if (fs.existsSync(directPath)) {
-  //         this.logger.verbose(`Found compiler at: ${directPath}`);
-  //         return directPath;
-  //       }
-  //     } else {
-  //       // 其他编译器
-  //       const fullPath = path.join(toolsPath, compilerCmd);
-  //       if (fs.existsSync(fullPath)) {
-  //         this.logger.verbose(`Found compiler at: ${fullPath}`);
-  //         return fullPath;
-  //       }
-  //     }
-  //   }
-    
-  //   // 如果找不到完整路径，尝试使用系统 PATH
-  //   this.logger.verbose(`Compiler not found in configured paths, using system PATH: ${compilerCmd}`);
-  //   return compilerCmd;
-  // }
 
   /**
    * 构建包含路径 - 使用 DependencyAnalyzer 动态分析依赖
    */
   private async buildIncludePaths(config: Record<string, any>, options: LintOptions, arduinoConfig: any): Promise<string[]> {
-    const includes: string[] = [];
+    const includes: string[] = [`-I"${path.dirname(path.resolve(options.sketchPath))}"`];
     
     try {
       // 设置 DependencyAnalyzer 需要的环境变量（参考 ArduinoCompiler）
@@ -1676,307 +645,36 @@ export class ArduinoLinter {
   
 
 
-  /**
-   * 提取 sketch 中直接引用的头文件
-   */
-  // private extractDirectIncludes(sketchPath: string): string[] {
-  //   try {
-  //     const content = fs.readFileSync(sketchPath, 'utf-8');
-  //     const includeRegex = /#include\s*[<"]([^>"]+)[>"]/g;
-  //     const includes: string[] = [];
-  //     let match;
-      
-  //     while ((match = includeRegex.exec(content)) !== null) {
-  //       includes.push(match[1]);
-  //     }
-      
-  //     return includes;
-  //   } catch (error) {
-  //     this.logger.verbose(`Failed to read sketch file: ${error}`);
-  //     return [];
-  //   }
-  // }
-  
-  /**
-   * 判断是否是必需库（总是需要包含的核心库）
-   */
-  // private isEssentialLibrary(libraryName: string): boolean {
-  //   const essentialLibraries = [
-  //     'WiFi',           // WiFi 连接核心
-  //     'Network',        // 网络基础
-  //     'WebServer',      // Web 服务器
-  //     'HTTPClient',     // HTTP 客户端
-  //     'FS',             // 文件系统
-  //     'EEPROM',         // EEPROM 存储
-  //     'Ticker',         // 定时器
-  //     'BLE',            // 蓝牙
-  //     'NetworkClientSecure', // 安全网络客户端
-  //     'DHT_sensor_library',  // DHT 传感器（常用）
-  //     'Adafruit_Unified_Sensor' // Adafruit 传感器统一接口
-  //   ];
-    
-  //   return essentialLibraries.includes(libraryName);
-  // }
-
-  /**
-   * 添加库源目录，参考 DependencyAnalyzer.findSourceDirectories 的逻辑
-   */
-  // private addLibrarySourceDirectories(libraryBasePath: string, includes: string[]): void {
-  //   try {
-  //     // 递归查找所有包含头文件的目录
-  //     const headerDirs = this.findHeaderDirectories(libraryBasePath);
-      
-  //     for (const dir of headerDirs) {
-  //       if (!includes.includes(`-I"${dir}"`)) {
-  //         includes.push(`-I"${dir}"`);
-  //         this.logger.verbose(`Added library header directory: ${dir}`);
-  //       }
-  //     }
-  //   } catch (error) {
-  //     this.logger.verbose(`Warning: Could not scan library directory ${libraryBasePath}: ${error}`);
-  //   }
-  // }
-
-  /**
-   * 查找包含头文件的目录，简化版本的 DependencyAnalyzer.findSourceDirectories
-   */
-  // private findHeaderDirectories(basePath: string): string[] {
-  //   const headerDirs = new Set<string>();
-    
-  //   try {
-  //     // 递归查找所有头文件
-  //     const entries = fs.readdirSync(basePath, { withFileTypes: true });
-      
-  //     for (const entry of entries) {
-  //       const fullPath = path.join(basePath, entry.name);
-        
-  //       // 跳过示例、测试等目录
-  //       if (entry.isDirectory() && !['examples', 'extras', 'test', 'tests', 'docs'].includes(entry.name)) {
-  //         // 检查当前目录是否有头文件
-  //         const hasHeaders = this.hasHeaderFiles(fullPath);
-  //         if (hasHeaders) {
-  //           headerDirs.add(fullPath);
-  //         }
-          
-  //         // 递归查找子目录
-  //         const subDirs = this.findHeaderDirectories(fullPath);
-  //         subDirs.forEach(dir => headerDirs.add(dir));
-  //       }
-  //     }
-  //   } catch (error) {
-  //     // 忽略读取错误
-  //   }
-    
-  //   return Array.from(headerDirs);
-  // }
-
-  /**
-   * 检查目录是否包含头文件
-   */
-  // private hasHeaderFiles(dirPath: string): boolean {
-  //   try {
-  //     const files = fs.readdirSync(dirPath);
-  //     return files.some(file => /\.(h|hpp)$/i.test(file));
-  //   } catch {
-  //     return false;
-  //   }
-  // }
-
-  /**
-   * 构建编译器定义
-   */
-  // private buildDefines(config: Record<string, any>): string[] {
-  //   return [
-  //     `-DARDUINO=${config['runtime.ide.version'] || '10607'}`,
-  //     `-DARDUINO_${config['build.board'] || 'UNKNOWN'}`,
-  //     `-DARDUINO_ARCH_${(config['build.arch'] || 'UNKNOWN').toUpperCase()}`,
-  //     `-DF_CPU=${config['build.f_cpu'] || '16000000L'}`,
-  //     `-DPROJECT_NAME="lint_check"`
-  //   ];
-  // }
-
-  /**
-   * 解析编译器错误输出
-   */
-  private parseCompilerErrors(compilerOutput: string, originalFile: string): {
-    errors: LintError[];
-    warnings: LintError[];
-    notes: LintError[];
-  } {
-    const errors: LintError[] = [];
-    const warnings: LintError[] = [];
-    const notes: LintError[] = [];
-    
-    if (!compilerOutput.trim()) {
-      return { errors, warnings, notes };
-    }
-    
-    this.logger.verbose(`Parsing compiler output: ${compilerOutput}`);
-    
-    // 解析 GCC 输出格式
-    // 支持多种格式：
-    // 1. file:line:column: severity: message
-    // 2. file:line: fatal error: message
-    // 3. In file included from file:line:
-    const lines = compilerOutput.split('\n');
-    
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      
-      // 尝试从行中提取编译器错误信息（可能嵌套在其他文本中）
-      // 匹配格式：任何地方的 file:line:column: severity: message
-      let match = line.match(/([^:\s]+):(\d+):(\d+):\s*(error|warning|note|fatal error):\s*(.+)$/);
-      if (match) {
-        const [, file, lineNum, colNum, severity, message] = match;
-        
-        // 计算正确的行号：需要减去添加的头文件行数
-        // 我们在 convertSketchToCpp 中添加了 #include <Arduino.h> 和可能的函数声明
-        // const originalLine = this.mapLineNumberToOriginal(parseInt(lineNum, 10));
-        const originalLine = parseInt(lineNum, 10); // 简化处理，直接使用编译器行号
-        
-        const lintError: LintError = {
-          file: originalFile, // 使用原始文件名而不是临时文件名
-          line: originalLine,
-          column: parseInt(colNum, 10),
-          message: message.trim(),
-          severity: severity.includes('error') ? 'error' : severity as 'error' | 'warning' | 'note'
-        };
-        
-        switch (lintError.severity) {
-          case 'error':
-            errors.push(lintError);
-            break;
-          case 'warning':
-            warnings.push(lintError);
-            break;
-          case 'note':
-            notes.push(lintError);
-            break;
-        }
-        continue;
-      }
-      
-      // 匹配无行号格式：file: fatal error: message
-      match = line.match(/^([^:]+):\s*(fatal error|error):\s*(.+)$/);
-      if (match) {
-        const [, file, severity, message] = match;
-        
-        const lintError: LintError = {
-          file: originalFile,
-          line: 1,
-          column: 1,
-          message: message.trim(),
-          severity: 'error'
-        };
-        
-        errors.push(lintError);
-        continue;
-      }
-      
-      // 匹配其他错误格式，如 "compilation terminated"
-      if (line.includes('fatal error') || line.includes('error:')) {
-        const lintError: LintError = {
-          file: originalFile,
-          line: 1,
-          column: 1,
-          message: line,
-          severity: 'error'
-        };
-        
-        errors.push(lintError);
-      }
-    }
-    
-    return { errors, warnings, notes };
-  }
-
-  /**
-   * 将生成的 C++ 文件的行号映射回原始 sketch 文件的行号
-   */
-  private mapLineNumberToOriginal(cppLineNumber: number): number {
-    // 在 convertSketchToCpp 中，我们添加了：
-    // 1. #include <Arduino.h>  (第1行)
-    // 2. 空行                  (第2行)  
-    // 3. 可能的函数声明         (若干行)
-    // 4. 空行                  (第n行)
-    // 5. 原始代码开始           (第n+1行)
-    
-    // 简化处理：假设添加了2行头文件和声明
-    // 实际应该根据 convertSketchToCpp 的具体实现来计算
-    const headerLines = 2; // #include <Arduino.h> + 空行
-    
-    if (cppLineNumber <= headerLines) {
-      // 错误在头文件部分，映射到第1行
-      return 1;
-    }
-    
-    // 错误在原始代码部分，减去头文件行数
-    return Math.max(1, cppLineNumber - headerLines);
-  }
-
-  /**
-   * 生成缓存键
-   */
-  private generateCacheKey(options: LintOptions): string {
-    const keyData = {
-      board: options.board,
-      sdkPath: options.sdkPath,
-      toolsPath: options.toolsPath,
-      librariesPath: options.librariesPath,
-      boardOptions: options.boardOptions,
-      buildProperties: options.buildProperties
-    };
-    return Buffer.from(JSON.stringify(keyData)).toString('base64');
-  }
-
-  /**
-   * 检查缓存是否过期
-   */
-  private isCacheExpired(cache: LintCache, options: LintOptions): boolean {
-    if (!cache.lastModified) return true;
-    
-    // 缓存有效期：5分钟
-    const cacheTimeout = 5 * 60 * 1000;
-    if (Date.now() - cache.lastModified > cacheTimeout) {
-      return true;
-    }
-    
-    // 检查关键文件是否被修改
-    try {
-      const sketchStat = fs.statSync(options.sketchPath);
-      return sketchStat.mtimeMs > cache.lastModified;
-    } catch {
-      return true;
-    }
-  }
 
   /**
    * 优化的依赖分析 - 使用 DependencyAnalyzer
    */
-  private async performOptimizedDependencyAnalysis(options: LintOptions): Promise<any[]> {
+  private async performOptimizedDependencyAnalysis(options: LintOptions, suppliedConfigResult?: any): Promise<any[]> {
     try {
       // 构建 FQBN 字符串
       const fqbn = options.board;
-      const buildProperties = options.buildProperties || {};
+      const buildProperties = this.getMergedBuildProperties(options);
       
       // 首先尝试从缓存获取配置解析结果
-      let configResult = await this.getCachedConfigResult(options);
+      let configResult = suppliedConfigResult || await this.getCachedConfigResult(options);
       
       if (!configResult) {
         // 缓存未命中，执行配置解析
-        configResult = await this.configParser.parseByFQBN(fqbn, buildProperties);
+        configResult = await this.configParser.parseByFQBN(
+          fqbn,
+          buildProperties,
+          this.parseToolVersions(options.toolVersions)
+        );
         // 缓存配置结果
         await this.cacheConfigResult(options, configResult);
       }
       
       // 构建完整的 Arduino 配置对象（与 ArduinoCompiler 兼容）
       const arduinoConfig = {
-        ...configResult.platform,
-        ...configResult.board,
-        ...configResult.buildProperties,
         fqbn: configResult.fqbn,
-        fqbnObj: configResult.fqbnParsed
+        fqbnParsed: configResult.fqbnParsed,
+        platform: configResult.platform,
+        board: configResult.board
       };
       
       // 使用 DependencyAnalyzer 进行分析
@@ -2028,21 +726,55 @@ export class ArduinoLinter {
    * 从依赖信息构建库路径
    */
   private buildLibraryPathsFromDependencies(dependencies: any[]): string[] {
-    const libraryPaths: string[] = [];
+    const libraryPaths = new Set<string>();
     
     for (const dep of dependencies) {
-      if (dep.path && fs.existsSync(dep.path)) {
-        libraryPaths.push(dep.path);
-        
-        // 添加 src 子目录
-        const srcPath = path.join(dep.path, 'src');
-        if (fs.existsSync(srcPath)) {
-          libraryPaths.push(srcPath);
-        }
+      if (dep.type === 'library' && dep.path && fs.existsSync(dep.path)) {
+        libraryPaths.add(dep.path);
       }
     }
     
-    return libraryPaths;
+    return [...libraryPaths];
+  }
+
+  private async calculateSketchInputHash(sketchPath: string, buildPath?: string): Promise<string> {
+    const resolvedSketchPath = path.resolve(sketchPath);
+    const sketchDirectory = path.dirname(resolvedSketchPath);
+    const excludedBuildPath = buildPath ? path.resolve(buildPath) : null;
+    const sourceExtensions = new Set([
+      '.ino', '.pde', '.h', '.hh', '.hpp', '.hxx',
+      '.c', '.cc', '.cpp', '.cxx', '.s', '.S'
+    ]);
+    const sourceFiles: string[] = [];
+
+    const visit = async (directory: string): Promise<void> => {
+      const entries = await fs.readdir(directory, { withFileTypes: true });
+      for (const entry of entries) {
+        const entryPath = path.resolve(directory, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === '.git' || entry.name === 'node_modules' || entryPath === excludedBuildPath) continue;
+          await visit(entryPath);
+        } else if (entry.isFile() && sourceExtensions.has(path.extname(entry.name))) {
+          sourceFiles.push(entryPath);
+        }
+      }
+    };
+
+    try {
+      await visit(sketchDirectory);
+      sourceFiles.sort((left, right) => left.localeCompare(right));
+      const hash = crypto.createHash('sha256');
+      for (const sourceFile of sourceFiles) {
+        hash.update(path.relative(sketchDirectory, sourceFile).replace(/\\/g, '/'));
+        hash.update('\0');
+        hash.update(await fs.readFile(sourceFile));
+        hash.update('\0');
+      }
+      return hash.digest('hex');
+    } catch {
+      const fileContent = await fs.readFile(resolvedSketchPath);
+      return crypto.createHash('sha256').update(fileContent).digest('hex');
+    }
   }
 
   /**
@@ -2053,11 +785,11 @@ export class ArduinoLinter {
       ? options.librariesPath.join(';') 
       : (options.librariesPath || '');
     
-    // 计算源文件内容的哈希值，确保文件变化时缓存失效
+    // 所有草图目录内的源码/头文件共享一个快照哈希，多 tab 或本地头变化时一并失效。
     let fileContentHash = '';
     try {
-      const fileContent = await fs.readFile(options.sketchPath, 'utf-8');
-      fileContentHash = crypto.createHash('md5').update(fileContent).digest('hex');
+      fileContentHash = options.cacheInputHash
+        || await this.calculateSketchInputHash(options.sketchPath, options.buildPath);
     } catch (error) {
       // 如果读取文件失败，使用文件路径和时间戳
       fileContentHash = crypto.createHash('md5').update(`${options.sketchPath}_${Date.now()}`).digest('hex');
@@ -2073,105 +805,34 @@ export class ArduinoLinter {
       boardOptions: JSON.stringify(options.boardOptions || {}),
       sourceFile: options.sketchPath,
       fileContentHash, // 新增：文件内容哈希
+      toolVersions: options.toolVersions || '',
       mode: options.mode
     };
   }
 
   /**
-   * 智能决策是否需要编译器检查
+   * 准备编译器分析所需的配置、依赖与内存缓存。
    */
-  private shouldUseCompilerCheck(staticResult: StaticAnalysisResult, options: LintOptions): boolean {
-    // 如果静态分析明确建议需要编译器检查，直接采纳
-    if (staticResult.needsCompilerCheck) {
-      return true;
-    }
-
-    // fast 模式优先：强制跳过编译器检查（即使有warnings）
-    if (options.mode === 'fast') {
-      return false;
-    }
-
-    // 如果发现严重错误或警告，需要编译器验证（auto/accurate模式）
-    if (staticResult.errors.length > 0 || staticResult.warnings.length > 0) {
-      return true;
-    }
-
-    if (options.mode === 'accurate') {
-      return true; // accurate 模式强制使用编译器检查
-    }
-
-    // auto 模式的智能决策
-    const warningCount = staticResult.warnings.length;
-    
-    // 如果静态分析置信度高且警告较少，跳过编译器检查
-    if (staticResult.confidence === 'high' && warningCount <= 2) {
-      return false;
-    }
-
-    // 如果静态分析置信度中等且警告很少，可能跳过编译器检查
-    if (staticResult.confidence === 'medium' && warningCount <= 1) {
-      return false;
-    }
-
-    // 其他情况都使用编译器检查
-    return true;
-  }
-
-  /**
-   * 并行准备配置和依赖分析
-   */
-  private async performParallelPreparation(options: LintOptions, cacheKey: string): Promise<{
+  private async prepareCompilerAnalysis(options: LintOptions): Promise<{
     cachedData: LintCache;
     configResult: any;
     dependencies: any[];
   }> {
-    // 首先尝试从缓存获取
+    const configResult = await this.getOrParseConfig(options);
     let dependencies = await this.getCachedDependencyResult(options);
-    let cachedData = this.cache.get(cacheKey);
-    
-    if (!dependencies || !cachedData || this.isCacheExpired(cachedData, options)) {
-      this.logger.verbose('Cache miss or expired, performing parallel preparation...');
-      
-      // 并行执行配置解析和依赖分析
-      const [configResult, newDependencies] = await Promise.all([
-        this.getOrParseConfig(options),
-        this.performOptimizedDependencyAnalysis(options)
-      ]);
-      
-      dependencies = newDependencies;
-      
-      // 构建 Arduino 配置对象
-      const arduinoConfig = {
-        ...configResult.platform,
-        ...configResult.board,
-        ...configResult.buildProperties,
-        fqbn: configResult.fqbn,
-        fqbnObj: configResult.fqbnParsed
-      };
-      
-      cachedData = {
-        config: arduinoConfig,
-        dependencies,
-        lastModified: Date.now()
-      };
-      
-      // 并行缓存结果
-      await Promise.all([
-        this.cacheConfigResult(options, configResult),
-        this.cacheDependencyResult(options, dependencies)
-      ]);
-      
-      this.cache.set(cacheKey, cachedData);
-      
-      return { cachedData, configResult, dependencies };
+
+    if (dependencies === null) {
+      this.logger.verbose('Dependency cache miss, analyzing dependencies...');
+      dependencies = await this.performOptimizedDependencyAnalysis(options, configResult);
+      await this.cacheDependencyResult(options, dependencies);
     } else {
-      this.logger.verbose('Using cached configuration and dependencies');
-      
-      // 从缓存获取配置结果
-      const configResult = await this.getCachedConfigResult(options);
-      
-      return { cachedData, configResult: configResult || {}, dependencies };
+      this.logger.verbose('Using cached dependency analysis');
     }
+
+    const cachedData: LintCache = { dependencies };
+
+    await this.cacheConfigResult(options, configResult);
+    return { cachedData, configResult, dependencies };
   }
 
   /**
@@ -2182,7 +843,11 @@ export class ArduinoLinter {
     
     if (!configResult) {
       // 缓存未命中，执行配置解析
-      configResult = await this.configParser.parseByFQBN(options.board, options.buildProperties || {});
+      configResult = await this.configParser.parseByFQBN(
+        options.board,
+        this.getMergedBuildProperties(options),
+        this.parseToolVersions(options.toolVersions)
+      );
     } else {
       this.logger.verbose('Using cached configuration result');
     }

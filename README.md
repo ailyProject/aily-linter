@@ -19,6 +19,8 @@ node dist/bundle-min/index.js --help
 
 产物位于 `dist/bundle-min`，其中 `index.js` 是 CLI 入口，`aily-linter.js` 是由 esbuild 打包并压缩后的单文件代码。
 
+根目录 npm 包是正式发布物；`bundle-min` 是标记为 private 的离线/嵌入式发布产物，不单独发布到 npm。发布前运行 `npm run release:verify`，详细约定见 `docs/PUBLISHING.md`。
+
 如需在本机注册 `aily-linter` 命令：
 
 ```powershell
@@ -41,7 +43,7 @@ aily-linter sketch.ino --mode accurate `
   --sdk-path D:\path\to\arduino-avr `
   --tools-path D:\path\to\tools
 
-# 先做快速检查，必要时再调用编译器
+# 合并快速规则结果与编译器语义验证结果
 aily-linter sketch.ino --mode auto --format json
 ```
 
@@ -56,12 +58,12 @@ aily-linter --help
 | 模式 | 实现 | 是否需要 Arduino 工具链 |
 | --- | --- | --- |
 | `fast` | 单遍轻量词法扫描与 Arduino 规则 | 否 |
-| `accurate` | Arduino 配置解析、依赖分析与编译器语法检查 | 是 |
-| `auto` | 快速检查后按需执行精确检查 | 视检查结果而定 |
+| `accurate` | Arduino 草图预处理、配置与依赖解析、编译器语法/类型检查 | 是 |
+| `auto` | 快速规则检查，并强制完成编译器语义验证 | 是 |
 
-`accurate` 和可能进入编译器阶段的 `auto` 模式，需要有效的开发板 FQBN、SDK 和工具链路径。
+`accurate` 和 `auto` 模式都需要有效的开发板 FQBN、SDK 和工具链路径。`auto` 不会再根据轻量扫描的置信度跳过编译器；工具链不可用时会明确失败，避免把未经语义验证的草图报告为成功。
 
-`fast` 支持 `minimal`、`standard`、`strict`、`esp32`、`stm32` 规则集。它使用注释、字符串、括号和调用参数感知的单遍扫描器，不依赖 tree-sitter、ast-grep、WASM 或其他原生解析模块。模板实例化、重载解析、完整类型检查等 C++ 语义由 `accurate` 模式或 `auto` 的编译器阶段负责。
+`fast` 支持 `minimal`、`standard`、`strict`、`esp32`、`stm32` 规则集。它使用注释、字符串、括号和调用参数感知的单遍扫描器，不依赖 tree-sitter、ast-grep、WASM 或其他原生解析模块。它定位于结构和风格检查，不承诺完整的 C++ 语法、符号或类型验证；这些语义由 `accurate` 模式或 `auto` 的编译器阶段负责。
 
 依赖分析使用独立的预处理指令扫描器处理 `#if`、宏展开和递归 include。头文件仍在 include 出现的位置处理，因此头文件定义的宏可以影响后续条件分支。
 
@@ -82,6 +84,15 @@ npm run check
 npm test
 npm run smoke
 npm run benchmark
+```
+
+真实 SDK 集成测试通过环境变量启用，未提供 SDK 时会显式跳过：
+
+```powershell
+$env:AILY_LINTER_TOOLS_PATH='D:\path\to\tools'
+$env:AILY_LINTER_AVR_SDK_PATH='D:\path\to\avr'
+$env:AILY_LINTER_ESP32_SDK_PATH='D:\path\to\esp32'
+npm run test:integration
 ```
 
 基准脚本会生成约 2 MiB 的注释和字符串压力数据，并对小文件冷启动与大文件吞吐分别执行多次独立进程测量。结果写入 `bench/results-*.json`；可通过 `BENCH_ITERATIONS` 调整重复次数。

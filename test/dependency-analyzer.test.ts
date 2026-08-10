@@ -10,8 +10,8 @@ test('uses response-file macros and resets dependencies between preprocess sessi
   const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'aily-linter-deps-'));
   const libraryRoot = path.join(fixtureRoot, 'libraries');
   const librarySource = path.join(libraryRoot, 'TestLib', 'src');
-  const firstSketch = path.join(fixtureRoot, 'first.ino');
-  const secondSketch = path.join(fixtureRoot, 'second.ino');
+  const firstSketch = path.join(fixtureRoot, 'first', 'first.ino');
+  const secondSketch = path.join(fixtureRoot, 'second', 'second.ino');
   const responseFile = path.join(fixtureRoot, 'compiler.rsp');
   const environmentKeys = [
     'LOCALAPPDATA',
@@ -28,6 +28,8 @@ test('uses response-file macros and resets dependencies between preprocess sessi
 
   try {
     await mkdir(librarySource, { recursive: true });
+    await mkdir(path.dirname(firstSketch), { recursive: true });
+    await mkdir(path.dirname(secondSketch), { recursive: true });
     await writeFile(responseFile, '-DENABLE_TEST_LIBRARY=1\n');
     await writeFile(firstSketch, `
 #if ENABLE_TEST_LIBRARY
@@ -72,6 +74,105 @@ test('uses response-file macros and resets dependencies between preprocess sessi
       } else {
         process.env[key] = value;
       }
+    }
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('follows sketch-local headers to discover nested library dependencies', async () => {
+  const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'aily-linter-local-deps-'));
+  const libraryRoot = path.join(fixtureRoot, 'libraries');
+  const librarySource = path.join(libraryRoot, 'NestedLib', 'src');
+  const tabLibrarySource = path.join(libraryRoot, 'TabLib', 'src');
+  const sketch = path.join(fixtureRoot, 'main.ino');
+  const tabSketch = path.join(fixtureRoot, 'tab.ino');
+  const localHeader = path.join(fixtureRoot, 'local_config.h');
+  const previousEnvironment = new Map([
+    ['LOCALAPPDATA', process.env.LOCALAPPDATA],
+    ['SKETCH_PATH', process.env.SKETCH_PATH],
+    ['LIBRARIES_PATH', process.env.LIBRARIES_PATH],
+    ['SDK_CORE_PATH', process.env.SDK_CORE_PATH],
+    ['SDK_VARIANT_PATH', process.env.SDK_VARIANT_PATH],
+    ['SDK_CORE_LIBRARIES_PATH', process.env.SDK_CORE_LIBRARIES_PATH]
+  ]);
+
+  try {
+    await mkdir(librarySource, { recursive: true });
+    await mkdir(tabLibrarySource, { recursive: true });
+    await writeFile(sketch, '#include "local_config.h"\nvoid setup() {}\nvoid loop() {}\n');
+    await writeFile(tabSketch, '#include <TabLib.h>\nvoid tabHelper() {}\n');
+    await writeFile(localHeader, '#pragma once\n#include <NestedLib.h>\n');
+    await writeFile(path.join(librarySource, 'NestedLib.h'), '#pragma once\n');
+    await writeFile(path.join(librarySource, 'NestedLib.cpp'), '#include "NestedLib.h"\n');
+    await writeFile(path.join(tabLibrarySource, 'TabLib.h'), '#pragma once\n');
+    await writeFile(path.join(tabLibrarySource, 'TabLib.cpp'), '#include "TabLib.h"\n');
+
+    process.env.LOCALAPPDATA = path.join(fixtureRoot, 'cache');
+    process.env.SKETCH_PATH = sketch;
+    process.env.LIBRARIES_PATH = libraryRoot;
+    delete process.env.SDK_CORE_PATH;
+    delete process.env.SDK_VARIANT_PATH;
+    delete process.env.SDK_CORE_LIBRARIES_PATH;
+
+    const logger = new Logger();
+    logger.setQuiet(true);
+    const dependencies = await new DependencyAnalyzer(logger).preprocess({
+      fqbn: 'test:host:fixture',
+      fqbnParsed: { package: 'test', platform: 'host', boardId: 'fixture' },
+      platform: { 'recipe.cpp.o.pattern': 'g++' },
+      board: {}
+    });
+    assert.ok(dependencies.some(dependency => dependency.name === 'NestedLib'));
+    assert.ok(dependencies.some(dependency => dependency.name === 'TabLib'));
+  } finally {
+    for (const [key, value] of previousEnvironment) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('prefers a matching user library before broad system-header prefixes', async () => {
+  const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'aily-linter-system-prefix-'));
+  const libraryRoot = path.join(fixtureRoot, 'libraries');
+  const librarySource = path.join(libraryRoot, 'MemoryTools', 'src');
+  const sketch = path.join(fixtureRoot, 'main.ino');
+  const previousEnvironment = new Map([
+    ['LOCALAPPDATA', process.env.LOCALAPPDATA],
+    ['SKETCH_PATH', process.env.SKETCH_PATH],
+    ['LIBRARIES_PATH', process.env.LIBRARIES_PATH],
+    ['SDK_CORE_PATH', process.env.SDK_CORE_PATH],
+    ['SDK_VARIANT_PATH', process.env.SDK_VARIANT_PATH],
+    ['SDK_CORE_LIBRARIES_PATH', process.env.SDK_CORE_LIBRARIES_PATH]
+  ]);
+
+  try {
+    await mkdir(librarySource, { recursive: true });
+    await writeFile(sketch, '#include <memory_tools.h>\nvoid setup() {}\nvoid loop() {}\n');
+    await writeFile(path.join(librarySource, 'memory_tools.h'), '#pragma once\n');
+    await writeFile(path.join(librarySource, 'memory_tools.cpp'), '#include "memory_tools.h"\n');
+
+    process.env.LOCALAPPDATA = path.join(fixtureRoot, 'cache');
+    process.env.SKETCH_PATH = sketch;
+    process.env.LIBRARIES_PATH = libraryRoot;
+    delete process.env.SDK_CORE_PATH;
+    delete process.env.SDK_VARIANT_PATH;
+    delete process.env.SDK_CORE_LIBRARIES_PATH;
+
+    const logger = new Logger();
+    logger.setQuiet(true);
+    const dependencies = await new DependencyAnalyzer(logger).preprocess({
+      fqbn: 'test:host:fixture',
+      fqbnParsed: { package: 'test', platform: 'host', boardId: 'fixture' },
+      platform: { 'recipe.cpp.o.pattern': 'g++' },
+      board: {}
+    });
+    assert.ok(dependencies.some(dependency => dependency.name === 'MemoryTools'));
+  } finally {
+    for (const [key, value] of previousEnvironment) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
     }
     await rm(fixtureRoot, { recursive: true, force: true });
   }

@@ -623,7 +623,9 @@ export class ArduinoConfigParser {
             // 根据操作系统选择Arduino15目录的正确路径
             const arduino15BasePath = os.platform() === 'win32'
                 ? path.join(os.homedir(), 'AppData', 'Local', 'Arduino15')
-                : path.join(os.homedir(), 'Library', 'Arduino15');
+                : os.platform() === 'darwin'
+                    ? path.join(os.homedir(), 'Library', 'Arduino15')
+                    : path.join(os.homedir(), '.arduino15');
             let ARDUINO15_PACKAGE_PATH = path.join(arduino15BasePath, 'packages', fqbnObj.package);
             let ARDUINO15_PACKAGE_HARDWARE_PATH = path.join(ARDUINO15_PACKAGE_PATH, 'hardware', fqbnObj.platform);
             const platformTxtPattern = path.join(ARDUINO15_PACKAGE_HARDWARE_PATH, '**/platform.txt').replace(/\\/g, '/');
