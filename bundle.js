@@ -65,7 +65,6 @@ async function createPackageJson() {
   const bundlePackageJson = {
     name: `${projectPackageJson.name}-bundle`,
     version: projectPackageJson.version,
-    private: true,
     description: `${projectPackageJson.description} (standalone bundle)`,
     license: projectPackageJson.license,
     main: 'index.js',
