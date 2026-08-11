@@ -63,7 +63,7 @@ require('./aily-linter.js');
 async function createPackageJson() {
   const projectPackageJson = await fs.readJson('./package.json');
   const bundlePackageJson = {
-    name: `${projectPackageJson.name}-bundle`,
+    name: `${projectPackageJson.name}`,
     version: projectPackageJson.version,
     description: `${projectPackageJson.description} (standalone bundle)`,
     license: projectPackageJson.license,
