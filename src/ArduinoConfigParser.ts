@@ -833,6 +833,7 @@ export class ArduinoConfigParser {
 
             // 将配置行解析为对象，同时根据 buildProperties 过滤菜单选项
             const boardConfig: { [key: string]: string } = {};
+            const menuOptions = new Map<string, Set<string>>();
 
             boardLines.forEach(line => {
                 const trimmedLine = line.trim();
@@ -851,6 +852,8 @@ export class ArduinoConfigParser {
                         if (menuMatch) {
                             const menuType = menuMatch[1];
                             const menuOption = menuMatch[2];
+                            if (!menuOptions.has(menuType)) menuOptions.set(menuType, new Set());
+                            menuOptions.get(menuType)!.add(menuOption);
 
                             // 如果用户指定了这个菜单类型的值，只保留用户选择的选项
                             if (buildProperties[menuType]) {
@@ -873,6 +876,15 @@ export class ArduinoConfigParser {
                     }
                 }
             });
+
+            // Validate against the complete choices, not the filtered result,
+            // so an invalid selection cannot silently retain base build flags.
+            for (const [menuType, options] of menuOptions) {
+                const requested = buildProperties[menuType];
+                if (requested !== undefined && !options.has(requested)) {
+                    throw new Error(`Invalid board option ${menuType}=${JSON.stringify(requested)} for ${boardId}. Valid options: ${Array.from(options).join(', ')}`);
+                }
+            }
 
             return boardConfig;
         } catch (error) {
